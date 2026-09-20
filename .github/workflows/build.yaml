@@ -122,13 +122,24 @@ jobs:
           cp "$so" "out/libquickjs_bridge-$abi.so"
           echo "===== 产物校验 ====="
           readelf -h "$so" | grep -E 'Class|Machine' | sed 's/^/  /'
-          echo "  ff 大小: $(du -h "$so" | cut -f1)"
-          # 关键导出符号（宿主 Dart 直接 FFI 调用；缺失 = ABI 不完整）
-          for sym in qjs_set_callbacks qjs_clear_callbacks qjs_open_session qjs_call qjs_eval; do
-            n=$(nm -D --defined-only "$so" | grep -c " $sym$" || true)
-            echo "  $sym: $n"
-            [ "$n" -ge 1 ] || { echo "缺少导出符号 $sym"; exit 1; }
-          done
+          echo "  so 大小: $(du -h "$so" | cut -f1)"
+          # 导出符号基线校验（宿主 Dart 直接 FFI 调用，且签名严格对应）
+          # 清单 = abi/exports.txt（51 个函数，与现役生产 so 逐一对齐）。
+          # 少一个即 ABI 不完整、多一个需同步 Dart 绑定。改 so 后若确实要增删
+          # 导出函数，必须同步更新此清单 + Dart 绑定 + 升本体版本（见 README ABI 契约）。
+          mapfile -t expect < <(grep -vE '^\s*(#|$)' abi/exports.txt)
+          mapfile -t actual < <(nm -D --defined-only "$so" | awk '{print $NF}' | grep '^qjs_' | sort)
+          echo "  导出符号数：期望 ${#expect[@]}，实际 ${#actual[@]}"
+          missing=$(comm -23 <(printf '%s\n' "${expect[@]}" | sort) <(printf '%s\n' "${actual[@]}"))
+          if [ -n "$missing" ]; then
+            echo "缺少导出符号："; echo "$missing" | sed 's/^/    /'; exit 1
+          fi
+          extra=$(comm -13 <(printf '%s\n' "${expect[@]}" | sort) <(printf '%s\n' "${actual[@]}"))
+          if [ -n "$extra" ]; then
+            echo "新增导出符号（若为有意新增，请同步 abi/exports.txt + Dart 绑定 + 升本体版本）："
+            echo "$extra" | sed 's/^/    /'
+          fi
+          echo "  符号校验通过"
           echo "  动态依赖:"
           readelf -d "$so" | grep NEEDED | sed 's/.*\[/    /;s/\]//'
 

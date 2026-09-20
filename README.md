@@ -44,6 +44,11 @@ isolate）一创建就**覆盖**旧值 —— 若旧 isolate 仍有 native 任�
 `SIGSEGV` 启动崩溃（2026-09-20 实机事故）。DsPlayer 侧有
 `tools/qjs_native/check_abi_compat.py` 闸门做符号级校验。
 
+**符号基线**：`abi/exports.txt` 列出全部 51 个导出函数（从现役生产 so 导出，
+是 ABI 的唯一事实源）。CI 每次构建都比对：**缺符号即失败**（ABI 不完整），
+**多符号则告警**（需评估是否同步 Dart 绑定）。确实要增删导出函数时，改完
+`bridge/quickjs_bridge.c` 后必须同步更新此文件 —— 改它等于改 ABI。
+
 ## 构建
 
 ### 方式一：CI（推荐）

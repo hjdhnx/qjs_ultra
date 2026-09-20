@@ -1,0 +1,61 @@
+# libquickjs_bridge.so 导出符号基线（ABI 契约）
+#
+# 来源：现役生产 so（DsPlayer plugin_qjs/app/src/main/jniLibs/arm64-v8a/）
+# 生成：llvm-nm -D --defined-only <so> | awk '{print $NF}' | grep ^qjs_ | sort
+# 日期：2026-09-21
+#
+# 用途：CI 产物校验。少一个符号 = ABI 不完整（旧 Dart 绑定会崩）；
+# 多一个 = 需评估是否同步 Dart 绑定。改此文件 = 改 ABI，必须同步升本体版本。
+# 详见 README「ABI 契约」与 DsPlayer docs/plugin/QJS-PLUGIN-DESIGN.md。
+#
+qjs_array_length
+qjs_bridge_new_uint8_array
+qjs_call
+qjs_clear_callbacks
+qjs_compile
+qjs_dup_value
+qjs_eval
+qjs_eval_bytecode
+qjs_execute_pending_job
+qjs_free_buffer
+qjs_free_context
+qjs_free_runtime
+qjs_free_string_array
+qjs_free_value
+qjs_get_bytes
+qjs_get_exception
+qjs_get_float64
+qjs_get_global
+qjs_get_int32
+qjs_get_prop
+qjs_get_prop_u32
+qjs_get_tag
+qjs_install_module_loader
+qjs_is_array
+qjs_is_exception
+qjs_is_function
+qjs_make_bool
+qjs_make_float64
+qjs_make_int32
+qjs_make_null
+qjs_make_undefined
+qjs_memory_usage
+qjs_new_array
+qjs_new_context
+qjs_new_host_function
+qjs_new_object
+qjs_new_runtime
+qjs_new_string
+qjs_own_property_names
+qjs_parse_json
+qjs_register_function
+qjs_run_gc
+qjs_set_callbacks
+qjs_set_max_stack_size
+qjs_set_memory_limit
+qjs_set_prop
+qjs_set_prop_u32
+qjs_stringify
+qjs_throw_error
+qjs_to_cstring
+qjs_value_move
