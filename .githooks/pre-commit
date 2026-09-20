@@ -1,0 +1,30 @@
+#!/bin/sh
+# pre-commit — 镜像 CLAUDE.md -> AGENTS.md（供其他 AI agent 读取的协作入口）。
+#
+# 启用方式（每个克隆一次）：git config core.hooksPath .githooks
+# 行为：每次提交前用 CLAUDE.md 重新生成 AGENTS.md（顶部加自动生成声明），
+#       有变化则写入工作区并自动 stage 进本次提交，保证两份永远同步。
+# 注意：AGENTS.md 是生成物，不要直接编辑——改动请改 CLAUDE.md。
+
+set -e
+
+ROOT="$(git rev-parse --show-toplevel)"
+SRC="$ROOT/CLAUDE.md"
+DST="$ROOT/AGENTS.md"
+
+# CLAUDE.md 不存在（被删/改名）时不产出空镜像
+[ -f "$SRC" ] || exit 0
+
+{
+  printf '%s\n' '<!-- 由 .githooks/pre-commit 从 CLAUDE.md 自动生成，请勿直接编辑 -->'
+  printf '%s\n' ''
+  cat "$SRC"
+} > "$DST.tmp"
+
+if ! cmp -s "$DST.tmp" "$DST"; then
+  mv "$DST.tmp" "$DST"
+  git add -- "$DST"
+  echo "pre-commit: AGENTS.md 已从 CLAUDE.md 重新生成并加入本次提交"
+else
+  rm -f "$DST.tmp"
+fi

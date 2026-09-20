@@ -53,15 +53,26 @@ isolate）一创建就**覆盖**旧值 —— 若旧 isolate 仍有 native 任�
 
 ### 方式一：CI（推荐）
 
-Actions → `Build quickjs_bridge` → Run workflow：
+**自动**：push 到 `main` 且改动落在源码/构建链路径时，自动构建四架构并**发 Release**
+（附 `.so` + 校验和 + 构建信息）。
+
+监控路径（纯文档提交不触发，免得每次改 README 都跑一遍）：
+
+```
+bridge/**  native/**  CMakeLists.txt  abi/**  .github/workflows/**
+```
+
+PR 走同样的路径过滤，只构建不发布。
+
+**手动**：Actions → `Build quickjs_bridge` → Run workflow：
 
 | 输入 | 说明 |
 |---|---|
 | `arches` | 架构，空格分隔（缺省 `arm64-v8a armeabi-v7a x86 x86_64`） |
-| `release` | 勾选 = 构建完创建 Release 并发布 `.so` |
+| `release` | 勾选 = 构建完创建 Release 并发布 `.so`（push 触发时自动发布，无需勾选） |
 | `releaseTag` | Release tag（留空 = `build-<日期>-<短提交>`） |
 
-产物同时以 artifact（`so-<abi>`）形式附在 run 页。
+产物同时以 artifact（`so-<abi>`）形式附在 run 页，无需等 Release。
 
 **为什么优先 CI**：这套交叉编译链需要 NDK + CMake + Ninja + Go + 整个
 BoringSSL/lexbor/sqlite3 源码树，本地搭环境成本高；GitHub Actions 干净可复现，

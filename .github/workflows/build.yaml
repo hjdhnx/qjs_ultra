@@ -3,7 +3,21 @@ name: Build quickjs_bridge
 on:
   push:
     branches: [main]
+    # 只有源码/构建链改动才触发（并自动发 Release）；纯文档提交跳过，
+    # 免得每次改 README 都跑一遍四架构编译 + 堆一个 Release。
+    paths:
+      - 'bridge/**'
+      - 'native/**'
+      - 'CMakeLists.txt'
+      - 'abi/**'          # 符号基线变更 = ABI 变更，必须重新构建验证
+      - '.github/workflows/**'
   pull_request:
+    paths:
+      - 'bridge/**'
+      - 'native/**'
+      - 'CMakeLists.txt'
+      - 'abi/**'
+      - '.github/workflows/**'
   workflow_dispatch:
     inputs:
       arches:
@@ -12,7 +26,7 @@ on:
         default: 'arm64-v8a armeabi-v7a x86 x86_64'
         type: string
       release:
-        description: '构建完成后创建 Release 并发布 .so（勾选即发布）'
+        description: '手动触发时是否发布 Release（push 触发会自动发布，无需勾选）'
         required: false
         default: false
         type: boolean
@@ -150,10 +164,13 @@ jobs:
           path: out/*.so
 
   # 汇总发布：把四个架构的 .so 合成一份 Release（含校验和与构建信息）
+  #
+  # 触发条件：push 到 main（已由 on.push.paths 过滤为源码/构建链改动）自动发布；
+  # 手动触发需勾选 release。PR 不发布（event_name 为 pull_request）。
   release:
     name: Release
     needs: build
-    if: ${{ github.event.inputs.release == 'true' }}
+    if: ${{ github.event_name == 'push' || github.event.inputs.release == 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
