@@ -364,8 +364,11 @@ QJS_API void qjs_install_module_loader(JSRuntime *rt) {
 
 QJS_API void qjs_free_value(JSContext *ctx, JSValue *v) {
   JS_FreeValue(ctx, *v);
-  v->u.ptr = NULL;
-  v->tag = JS_TAG_UNDEFINED;
+  /* 置空调用方槽位：用 JS_UNDEFINED 而非 v->u.ptr/v->tag ——
+   * 后者只在 64 位（JS_PTR64，JSValue 是结构体）成立；32 位下
+   * JS_NAN_BOXING 把 JSValue 压成单个 uint64（见 quickjs.h:64-66），
+   * 字段访问编不过（2026-09-21 CI 实测 armeabi-v7a/x86 两条挂在此处）。 */
+  *v = JS_UNDEFINED;
 }
 
 QJS_API void qjs_dup_value(JSContext *ctx, JSValue *v) { JS_DupValue(ctx, *v); }
@@ -510,8 +513,7 @@ QJS_API int32_t qjs_get_prop(JSContext *ctx, JSValue *obj, const char *name,
 QJS_API int32_t qjs_set_prop(JSContext *ctx, JSValue *obj, const char *name,
                              JSValue *val) {
   int rc = JS_SetPropertyStr(ctx, *obj, name, *val);
-  val->u.ptr = NULL;
-  val->tag = JS_TAG_UNDEFINED;
+  *val = JS_UNDEFINED; /* 跨架构写法，见 qjs_free_value 注释 */
   return rc < 0 ? -1 : 0;
 }
 
@@ -525,8 +527,7 @@ QJS_API int32_t qjs_get_prop_u32(JSContext *ctx, JSValue *obj, uint32_t idx,
 QJS_API int32_t qjs_set_prop_u32(JSContext *ctx, JSValue *obj, uint32_t idx,
                                  JSValue *val) {
   int rc = JS_SetPropertyUint32(ctx, *obj, idx, *val);
-  val->u.ptr = NULL;
-  val->tag = JS_TAG_UNDEFINED;
+  *val = JS_UNDEFINED; /* 跨架构写法，见 qjs_free_value 注释 */
   return rc < 0 ? -1 : 0;
 }
 
