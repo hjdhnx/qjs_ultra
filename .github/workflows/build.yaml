@@ -73,6 +73,13 @@ jobs:
           go-version: 'stable'
           cache: false
 
+      # sdkmanager 需要 JDK 17+（runner 默认 11，不加这步 setup-android 直接失败）
+      - name: Setup Java JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
