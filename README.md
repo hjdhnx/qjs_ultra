@@ -130,6 +130,16 @@ native/quickjs/ext/
 ISC）、lexbor（Apache-2.0）、sqlite3（Public Domain）、zlib（zlib License）、
 wasm3（MIT）。仓根 `LICENSE` 为 GPL-3.0（继承自上游 Operit）。
 
+## 引擎能力文档（本仓）
+
+`docs/quickjs-android-api-docs.html` —— 本 so 向 JS 运行时注入的**全局能力权威清单**
+（cheerio / URL / URLSearchParams / TextEncoder/Decoder(含 GBK) / Buffer / crypto /
+WebCrypto / fs / zlib / DataBase(SQLite) / path / WebAssembly / atob-btoa / performance）
+与 Java 侧 QuickJSContext API。**重点看 §23 全局速查表**。
+
+写源或改桥接层时以此为准：**so 已有的 C 能力不要用 JS 重造**（手写 md5/base64/GBK/
+HTML 解析比 C 实现慢数倍）。DsPlayer 侧同份副本在 `docs/reference/`（背景资料）。
+
 ## 相关文档（DsPlayer 仓库）
 
 - `docs/plugin/QJS-PLUGIN-DESIGN.md` — QJS 引擎插件设计
