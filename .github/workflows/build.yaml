@@ -1,0 +1,205 @@
+name: Build quickjs_bridge
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      arches:
+        description: '要构建的架构（空格分隔：arm64-v8a armeabi-v7a x86 x86_64）'
+        required: false
+        default: 'arm64-v8a armeabi-v7a x86 x86_64'
+        type: string
+      release:
+        description: '构建完成后创建 Release 并发布 .so（勾选即发布）'
+        required: false
+        default: false
+        type: boolean
+      releaseTag:
+        description: 'Release tag（留空 = build-<日期>-<短提交>）'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  # 与本地构建链一致的锚点（改动需同步 README 与 DsPlayer 侧文档）
+  NDK_VERSION: 27.0.12077973
+  CMAKE_VERSION: 3.22.1
+  ANDROID_PLATFORM: android-24
+
+jobs:
+  # 把 arches 输入解析成 matrix（workflow_dispatch 的输入不能直接用 fromJSON）
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          ARCHES_INPUT: ${{ github.event.inputs.arches }}
+        run: |
+          ARCHES="$ARCHES_INPUT"
+          [ -n "$ARCHES" ] || ARCHES="arm64-v8a armeabi-v7a x86 x86_64"
+          # 校验架构名合法，避免手输错值静默产不出东西
+          for a in $ARCHES; do
+            case "$a" in
+              arm64-v8a|armeabi-v7a|x86|x86_64) ;;
+              *) echo "未知架构: $a（可选 arm64-v8a armeabi-v7a x86 x86_64）" >&2; exit 1 ;;
+            esac
+          done
+          JSON=$(printf '%s\n' $ARCHES | jq -R . | jq -sc .)
+          echo "matrix={\"abi\":$JSON}" >> "$GITHUB_OUTPUT"
+          echo "构建架构：$ARCHES"
+
+  build:
+    name: Build ${{ matrix.abi }}
+    needs: prepare
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # BoringSSL 源码编译需要 Go（BoringSSL 的生成阶段是 Go 写的）
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install NDK + CMake
+        run: |
+          set -e
+          # action 提供的环境变量名各版本不一，按序回退（缺失会导致 NDK 路径为空 → 配置阶段才炸）
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          [ -d "$SDK" ] || { echo "找不到 Android SDK: $SDK"; exit 1; }
+          sdkmanager "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$SDK/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "CMAKE_BIN=$SDK/cmake/$CMAKE_VERSION/bin" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          set -e
+          export PATH="$CMAKE_BIN:$PATH"
+          cmake -S . -B "build/${{ matrix.abi }}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${{ matrix.abi }}" \
+            -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
+            -DQJS_USE_BORINGSSL_SOURCE=ON \
+            -DBUILD_TESTING=OFF
+
+      - name: Build
+        run: |
+          set -e
+          export PATH="$CMAKE_BIN:$PATH"
+          cmake --build "build/${{ matrix.abi }}" -j"$(nproc)"
+
+      - name: Collect and verify
+        run: |
+          set -e
+          export PATH="$CMAKE_BIN:$PATH"
+          abi="${{ matrix.abi }}"
+          mkdir -p out
+          so="build/$abi/libquickjs_bridge.so"
+          [ -f "$so" ] || { echo "未找到产物: $so"; find build -name '*.so' | head; exit 1; }
+          cp "$so" "out/libquickjs_bridge-$abi.so"
+          echo "===== 产物校验 ====="
+          readelf -h "$so" | grep -E 'Class|Machine' | sed 's/^/  /'
+          echo "  ff 大小: $(du -h "$so" | cut -f1)"
+          # 关键导出符号（宿主 Dart 直接 FFI 调用；缺失 = ABI 不完整）
+          for sym in qjs_set_callbacks qjs_clear_callbacks qjs_open_session qjs_call qjs_eval; do
+            n=$(nm -D --defined-only "$so" | grep -c " $sym$" || true)
+            echo "  $sym: $n"
+            [ "$n" -ge 1 ] || { echo "缺少导出符号 $sym"; exit 1; }
+          done
+          echo "  动态依赖:"
+          readelf -d "$so" | grep NEEDED | sed 's/.*\[/    /;s/\]//'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: so-${{ matrix.abi }}
+          path: out/*.so
+
+  # 汇总发布：把四个架构的 .so 合成一份 Release（含校验和与构建信息）
+  release:
+    name: Release
+    needs: build
+    if: ${{ github.event.inputs.release == 'true' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download all .so
+        uses: actions/download-artifact@v7
+        with:
+          pattern: so-*
+          merge-multiple: true
+          path: out
+
+      - name: Prepare release assets
+        run: |
+          set -e
+          cd out
+          ls -la
+          sha256sum libquickjs_bridge-*.so > SHA256SUMS
+          md5sum libquickjs_bridge-*.so > MD5SUMS
+          {
+            echo "# quickjs_bridge Android 构建"
+            echo
+            echo "- 构建时间（UTC）：$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "- 提交：\`${GITHUB_SHA}\`"
+            echo "- NDK \`${NDK_VERSION}\` ｜ CMake \`${CMAKE_VERSION}\` ｜ platform \`${ANDROID_PLATFORM}\`"
+            echo "- 引擎：QuickJS + BoringSSL（源码编译，Go 生成）+ lexbor/sqlite3/zlib/wasm3"
+            echo
+            echo "## 产物"
+            echo
+            for f in libquickjs_bridge-*.so; do
+              printf -- '- `%s`（%s，sha256 %s…）\n' "$f" "$(du -h "$f" | cut -f1)" "$(sha256sum "$f" | cut -c1-16)"
+            done
+            echo
+            echo "## 用途"
+            echo
+            echo 'DsPlayer「QJS 引擎插件」（plugin_qjs）的 so 载体：'
+            echo '`libquickjs_bridge-<abi>.so` → `plugin_qjs/app/src/main/jniLibs/<abi>/libquickjs_bridge.so`。'
+            echo
+            echo '**ABI 契约**：本 so 的导出函数签名（如 `qjs_set_callbacks` 首参 ctx）'
+            echo '与 DsPlayer 的 Dart FFI 绑定严格对应，改签名 = 改 ABI ——'
+            echo '必须同时升本体版本并出包，否则旧本体加载新 so 会 SIGSEGV 启动崩溃。'
+            echo
+            echo '校验：`SHA256SUMS` / `MD5SUMS`。'
+          } > BUILD-INFO.md
+
+      - name: Set Tag Name
+        id: tag
+        env:
+          TAG_INPUT: ${{ github.event.inputs.releaseTag }}
+        run: |
+          TAG="$TAG_INPUT"
+          [ -n "$TAG" ] || TAG="build-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)"
+          echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: ${{ env.TAG_NAME }}
+          body_path: out/BUILD-INFO.md
+          make_latest: "true"
+          files: |
+            out/libquickjs_bridge-*.so
+            out/SHA256SUMS
+            out/MD5SUMS
+            out/BUILD-INFO.md
