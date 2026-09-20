@@ -1,0 +1,18 @@
+# 统一文本文件行尾为 LF。
+# 本仓构建跑在 Linux CI 上，而开发机是 Windows —— core.autocrlf 会按平台
+# 转换行尾，导致「本地 diff 全绿但 CI 挂」或反之（符号基线文件曾踩：
+# CRLF 的 \r 混进符号名，comm 比对把整表判成不同）。
+# 显式声明后，检出与提交都被规范化，跨平台一致。
+* text=auto eol=lf
+
+# 二进制（不要做行尾转换，否则损坏）
+*.so    binary
+*.a     binary
+*.o     binary
+*.dll   binary
+*.dylib binary
+*.exe   binary
+*.png   binary
+*.jpg   binary
+*.zip   binary
+*.json  text eol=lf

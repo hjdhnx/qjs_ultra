@@ -127,8 +127,8 @@ jobs:
           # 清单 = abi/exports.txt（51 个函数，与现役生产 so 逐一对齐）。
           # 少一个即 ABI 不完整、多一个需同步 Dart 绑定。改 so 后若确实要增删
           # 导出函数，必须同步更新此清单 + Dart 绑定 + 升本体版本（见 README ABI 契约）。
-          mapfile -t expect < <(grep -vE '^\s*(#|$)' abi/exports.txt)
-          mapfile -t actual < <(nm -D --defined-only "$so" | awk '{print $NF}' | grep '^qjs_' | sort)
+          mapfile -t expect < <(grep -vE '^\s*(#|$)' abi/exports.txt | tr -d '\r')
+          mapfile -t actual < <(nm -D --defined-only "$so" | awk '{print $NF}' | grep '^qjs_' | sort | tr -d '\r')
           echo "  导出符号数：期望 ${#expect[@]}，实际 ${#actual[@]}"
           missing=$(comm -23 <(printf '%s\n' "${expect[@]}" | sort) <(printf '%s\n' "${actual[@]}"))
           if [ -n "$missing" ]; then
