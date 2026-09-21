@@ -163,23 +163,126 @@ jobs:
           name: so-${{ matrix.abi }}
           path: out/*.so
 
+  # Windows x64 DLL：给 Dart 包的**真实引擎测试**用（CI 在本机加载跑用例，
+  # 见 dart-check job）。上游 CMakeLists 的 WIN32 分支已处理 MinGW 兼容
+  # （strndup / sized delete 补丁），这里只需装 mingw 与 cmake。
+  build-windows:
+    name: Build windows-x64 (dll)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 'stable'
+          cache: false
+
+      # MSYS2/MinGW-w64：CMakeLists 为 MinGW 写了兼容补丁，须用 GNU 工具链
+      - name: Setup MinGW
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build/windows-x64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build/windows-x64 -j"$(nproc)"
+
+      - name: Collect and verify
+        shell: msys2 {0}
+        run: |
+          set -e
+          mkdir -p out
+          dll="build/windows-x64/quickjs_bridge.dll"
+          [ -f "$dll" ] || { echo "未找到产物: $dll"; find build -name '*.dll' | head; exit 1; }
+          cp "$dll" "out/quickjs_bridge-windows-x64.dll"
+          echo "  大小: $(du -h "$dll" | cut -f1)"
+          # 符号基线校验（与本包 Dart 绑定对应的 ABI 契约）
+          mapfile -t expect < <(grep -vE '^\s*(#|$)' abi/exports.txt | tr -d '\r')
+          mapfile -t actual < <(objdump -p "$dll" | grep -oE 'qjs_[a-z_0-9]+' | sort -u || true)
+          missing=$(comm -23 <(printf '%s\n' "${expect[@]}" | sort) <(printf '%s\n' "${actual[@]}"))
+          if [ -n "$missing" ]; then echo "缺少导出符号："; echo "$missing" | sed 's/^/    /'; exit 1; fi
+          echo "  符号校验通过（${#expect[@]} 个）"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dll-windows-x64
+          path: out/*.dll
+
+  # Dart 包校验：analyze + 用真实 Windows DLL 跑引擎测试。
+  # 这是绑定层的**行为验证**——函数签名写错、结构体布局不符、内存管理漏 free
+  # 都只会在真正调用的那一刻暴露，静态分析查不出来。
+  dart-check:
+    name: Dart analyze + engine tests
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Download windows dll
+        uses: actions/download-artifact@v7
+        with:
+          name: dll-windows-x64
+          path: native/windows/x64
+
+      # 产物名带后缀，测试的 _resolveLib 按约定名找 —— 归一过去
+      - name: Normalize dll name
+        shell: bash
+        run: mv native/windows/x64/quickjs_bridge-windows-x64.dll native/windows/x64/quickjs_bridge.dll
+
+      - name: Pub get
+        run: dart pub get
+
+      - name: Analyze
+        run: dart analyze --fatal-infos
+
+      - name: Engine tests（真实加载 dll）
+        run: dart test --reporter expanded
+
   # 汇总发布：把四个架构的 .so 合成一份 Release（含校验和与构建信息）
   #
   # 触发条件：push 到 main（已由 on.push.paths 过滤为源码/构建链改动）自动发布；
   # 手动触发需勾选 release。PR 不发布（event_name 为 pull_request）。
   release:
     name: Release
-    needs: build
+    needs: [build, dart-check]
     if: ${{ github.event_name == 'push' || github.event.inputs.release == 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Download all .so
+      - name: Download all binaries
         uses: actions/download-artifact@v7
         with:
           pattern: so-*
+          merge-multiple: true
+          path: out
+
+      - name: Download windows dll
+        uses: actions/download-artifact@v7
+        with:
+          pattern: dll-*
           merge-multiple: true
           path: out
 
@@ -188,8 +291,9 @@ jobs:
           set -e
           cd out
           ls -la
-          sha256sum libquickjs_bridge-*.so > SHA256SUMS
-          md5sum libquickjs_bridge-*.so > MD5SUMS
+          # 覆盖 so 与 dll（Windows 需 MSYS 的 sha256sum，本 job 跑在 ubuntu）
+          sha256sum libquickjs_bridge-*.so quickjs_bridge-*.dll > SHA256SUMS
+          md5sum libquickjs_bridge-*.so quickjs_bridge-*.dll > MD5SUMS
           {
             echo "# quickjs_bridge Android 构建"
             echo
@@ -200,7 +304,7 @@ jobs:
             echo
             echo "## 产物"
             echo
-            for f in libquickjs_bridge-*.so; do
+            for f in libquickjs_bridge-*.so quickjs_bridge-*.dll; do
               printf -- '- `%s`（%s，sha256 %s…）\n' "$f" "$(du -h "$f" | cut -f1)" "$(sha256sum "$f" | cut -c1-16)"
             done
             echo
@@ -235,6 +339,7 @@ jobs:
           make_latest: "true"
           files: |
             out/libquickjs_bridge-*.so
+            out/quickjs_bridge-*.dll
             out/SHA256SUMS
             out/MD5SUMS
             out/BUILD-INFO.md

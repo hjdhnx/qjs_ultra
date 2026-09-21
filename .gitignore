@@ -23,3 +23,8 @@ CMakeUserPresets.json
 # 系统
 .DS_Store
 Thumbs.db
+
+# Dart / pub
+.dart_tool/
+.packages
+pubspec.lock

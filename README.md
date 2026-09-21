@@ -104,9 +104,52 @@ build/<abi>/libquickjs_bridge.so
   → pack/dist/DsPlayer-QJS-plugin-<版本>-<abi>.apk               （出包）
 ```
 
+## Dart 包（`qjs_ultra`）
+
+本仓同时是一个 **Dart/Flutter 包**：so 的 FFI 声明 + 引擎生命周期封装，
+纯 Dart + `dart:ffi`，不依赖 Flutter（Flutter app / 纯 Dart CLI / 服务端都可用）。
+
+```yaml
+# 使用方 pubspec.yaml（用 git 依赖取包）
+dependencies:
+  qjs_ultra:
+    git:
+      url: https://github.com/hjdhnx/qjs_ultra
+      ref: <commit>
+```
+
+```dart
+import 'package:qjs_ultra/qjs_ultra.dart';
+
+final engine = QuickjsEngine.createWith(
+  const JsEngineConfig(),
+  libPath: '/path/to/libquickjs_bridge.so',   // 见下方「产物去向」
+);
+engine.registerFunction('req', (args) => ...);   // 注入宿主能力
+final out = engine.evaluateModule(source);       // 执行爬虫源
+engine.dispose();
+```
+
+| 文件 | 内容 |
+|---|---|
+| `lib/src/qjs_bindings.dart` | FFI 声明（与 `abi/exports.txt` 的 51 个导出函数一一对应） |
+| `lib/src/js_engine.dart` | `JsEngine` / `JsEngineConfig` / `JsModuleLoader` 抽象 |
+| `lib/src/quickjs_engine.dart` | `QuickjsEngine` 实现（值编组 / 宿主函数桥 / 模块加载） |
+
+**平台前提**：只支持 **64 位**目标（arm64-v8a / x86_64）——`QjsValue` 按
+`struct { union u; int64 tag; }` 布局读取，这依赖引擎编为 64 位（`JS_PTR64`）。
+32 位下 `JS_NAN_BOXING` 会把 JSValue 压成单个 uint64，该读取路径失效。
+
+**测试**：`dart test` 会用真实动态库跑引擎用例（CI 的 `dart-check` job 用
+Windows DLL 实跑）。库路径经环境变量 `QJS_ULTRA_LIB` 指定，未设时回落
+`native/<平台>/<arch>/`。找不到库、或库为 ABI 改造前产物（缺
+`qjs_clear_callbacks`）时整组跳过并说明原因。
+
 ## 仓库结构
 
 ```
+lib/                               # Dart 包（FFI 绑定 + 引擎封装，见上节）
+test/engine_test.dart              # 真实引擎测试（CI 用 Windows DLL 跑）
 bridge/quickjs_bridge.c            # 对外 C API + DsPlayer 补丁（唯一的自维护文件）
 CMakeLists.txt                     # 顶层构建：qjs_engine 静态库 + bridge 共享库
 native/cpp/                        # JNI wrapper（供 Android 侧 Java 调用路径）
