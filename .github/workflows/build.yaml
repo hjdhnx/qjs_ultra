@@ -226,8 +226,14 @@ jobs:
         run: |
           set -e
           mkdir -p out
-          dll="build/windows-x64/quickjs_bridge.dll"
-          [ -f "$dll" ] || { echo "未找到产物: $dll"; find build -name '*.dll' | head; exit 1; }
+          # MinGW 默认产出带 lib 前缀（libquickjs_bridge.dll）—— 两种名字都认，
+          # 避免把「编好了但名字不同」误判成构建失败（2026-09-21 CI 实锤）
+          dll=""
+          for cand in build/windows-x64/libquickjs_bridge.dll build/windows-x64/quickjs_bridge.dll; do
+            [ -f "$cand" ] && dll="$cand" && break
+          done
+          [ -n "$dll" ] || { echo "未找到 dll"; find build -name '*.dll' | head; exit 1; }
+          echo "  产物: $dll"
           cp "$dll" "out/quickjs_bridge-windows-x64.dll"
           echo "  大小: $(du -h "$dll" | cut -f1)"
           # 符号基线校验（与本包 Dart 绑定对应的 ABI 契约）
