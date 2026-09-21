@@ -77,6 +77,13 @@ elseif(WIN32)
     # 注意：必须挂在 qjs_engine 的 INTERFACE（展开在 boringssl 之后），
     # 否则 libstdc++.a 先于 libcrypto.a 扫描，operator delete 无法回填。
     target_link_libraries(qjs_engine INTERFACE -static-libgcc -static-libstdc++)
+    # libwinpthread 也要静态：它由 Threads::Threads 隐式引入，默认动态链接
+    # 会让产物依赖 libwinpthread-1.dll —— 使用者没装 MSYS2/MinGW 运行时
+    # 就报 "The specified procedure could not be found"(error 127) 加载失败
+    # （2026-09-21 本机实测：CI 能跑过是因为构建机 PATH 里有 /mingw64/bin）。
+    # 静态后 DLL 无第三方运行时依赖，拿到即用。
+    target_link_options(quickjs_bridge PRIVATE -static-libgcc -static-libstdc++
+        -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive,-Bdynamic)
 
     # MinGW CRT 缺 strndup（qjs_url.c 等使用）：注入补丁实现
     file(WRITE ${CMAKE_BINARY_DIR}/mingw_compat_strndup.c

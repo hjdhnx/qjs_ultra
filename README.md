@@ -166,6 +166,19 @@ native/quickjs/ext/
   └── include/ tests/              # 头与测试宿主（QJS_BUILD_TESTS 控制）
 ```
 
+### 相对上游的构建改动（2026-09-21）
+
+除 DASH 无关的 libxml2 外，本仓另有两处**构建层**改动（`CMakeLists.txt`
+与 `bridge/quickjs_bridge.c` 之外唯一动过的上游文件）：
+
+| 改动 | 原因 |
+|---|---|
+| Windows DLL 静态链接 `libwinpthread` | 上游只静态了 `libgcc`/`libstdc++`，`libwinpthread-1.dll` 仍动态依赖 —— 使用者没装 MSYS2/MinGW 运行时即 `The specified procedure could not be found`(error 127) 加载失败（构建机因 PATH 含 `/mingw64/bin` 不受影响，本机实测才暴露） |
+
+> 注：DsPlayer 仓内 `tmp/qjs/native-src/` 是**上游原样副本**（不入 git），
+> 未含此改动 —— 它只服务 Windows 桌面路径，且那边用的是既有 DLL。
+> 若将来要在那边重建 Windows 产物，把本仓 CMakeLists 的 WIN32 段同步过去。
+
 ### 相对上游的裁剪（2026-09-21）
 
 删除了**编译不需要**的测试数据，292MB → 130MB：
