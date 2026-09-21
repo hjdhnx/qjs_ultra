@@ -59,8 +59,11 @@ isolate）一创建就**覆盖**旧值 —— 若旧 isolate 仍有 native 任�
 监控路径（纯文档提交不触发，免得每次改 README 都跑一遍）：
 
 ```
-bridge/**  native/**  CMakeLists.txt  abi/**  .github/workflows/**
+bridge/**  native/**  CMakeLists.txt  abi/**  lib/**  test/**  pubspec.yaml  .github/workflows/**
 ```
+
+`lib/**`、`test/**`、`pubspec.yaml` 也在内 —— Dart 绑定必须与 so 同步验证
+（绑定签名与导出符号是一体两面）。
 
 PR 走同样的路径过滤，只构建不发布。
 
