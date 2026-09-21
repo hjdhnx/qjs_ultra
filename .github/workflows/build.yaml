@@ -187,6 +187,10 @@ jobs:
       # （2026-09-21 CI 实锤）。Go 是 BoringSSL 源码编译的必需项。
       # nasm 是 BoringSSL 的 x86_64 优化汇编必需：Windows 不用 GAS，CMake 走
       # enable_language(ASM_NASM)，缺则 configure 阶段直接失败。
+      # **必须是 mingw-w64-x86_64-nasm（MINGW64 环境），不能用 MSYS 的 `nasm`
+      # 包**：MSYS 版是 POSIX 路径语义，拿到 `D:/a/...asm` 会把 `D:` 当非法
+      # 字符报 `no input file specified`（2026-09-21 CI 实锤，配 msystem:
+      # MINGW64 时该包落在 /mingw64/bin，与 gcc 同域）。
       # ⚠️ 注释必须写在 `install:` 折叠块**外**——块内注释会被当成包名传给
       #    msys2（首版就把中文注释当包去装了）。
       - name: Setup MinGW
@@ -199,7 +203,7 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-go
-            nasm
+            mingw-w64-x86_64-nasm
 
       - name: Configure
         shell: msys2 {0}
