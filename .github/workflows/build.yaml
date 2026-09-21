@@ -185,6 +185,10 @@ jobs:
       # PATH 不进 MSYS2 shell —— 找不到就静默回退「系统 OpenSSL」，而 MinGW
       # 环境没有 OpenSSL，于是链接期爆一片 `undefined reference to EVP_*`
       # （2026-09-21 CI 实锤）。Go 是 BoringSSL 源码编译的必需项。
+      # nasm 是 BoringSSL 的 x86_64 优化汇编必需：Windows 不用 GAS，CMake 走
+      # enable_language(ASM_NASM)，缺则 configure 阶段直接失败。
+      # ⚠️ 注释必须写在 `install:` 折叠块**外**——块内注释会被当成包名传给
+      #    msys2（首版就把中文注释当包去装了）。
       - name: Setup MinGW
         uses: msys2/setup-msys2@v2
         with:
@@ -195,6 +199,7 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-go
+            nasm
 
       - name: Configure
         shell: msys2 {0}
