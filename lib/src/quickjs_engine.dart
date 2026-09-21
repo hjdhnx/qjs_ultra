@@ -649,7 +649,10 @@ class QuickjsEngine implements JsEngine {
   Object? _jsToDart(Pointer<QjsValue> slot) {
     switch (_bridge.getTag(slot)) {
       case QjsTag.int_:
-        return slot.ref.u.u64;
+        // 与 C 侧 `JS_VALUE_GET_INT(v) = (int)(v).u.uint64` 对齐：u64 是无符号
+        // 容器，负数是二补码，**必须做 int32 有符号转换**。直接返回 u64 会把
+        // -42 读成 4294967254（2026-09-21 CI 真实引擎测试抓到）。
+        return slot.ref.u.u64.toSigned(32);
       case QjsTag.bool_:
         return slot.ref.u.u64 != 0;
       case QjsTag.float64:

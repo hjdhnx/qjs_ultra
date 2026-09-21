@@ -59,10 +59,20 @@ void main() {
       expect(engine.evaluate('undefined'), isNull);
     });
 
-    test('浮点与负数（验证 JSValue 的 union 读取路径）', () {
+    test('浮点（验证 JSValue 的 double 读取路径）', () {
       expect(engine.evaluate('3.14'), closeTo(3.14, 1e-9));
-      expect(engine.evaluate('-42'), -42);
       expect(engine.evaluate('0.1 + 0.2'), closeTo(0.3, 1e-9));
+    });
+
+    test('负整数不符号回绕（JSValue u64 是二补码容器）', () {
+      // -42 曾被读成 4294967254（漏 int32 有符号转换）——源里返回负数很常见
+      // （-1 哨兵、偏移量、坐标），静默变巨大正数极难排查。
+      expect(engine.evaluate('-42'), -42);
+      expect(engine.evaluate('-1'), -1);
+      expect(engine.evaluate('0 - 2147483648'), -2147483648);
+      expect(engine.evaluate('2147483647'), 2147483647);
+      expect(engine.evaluate('({n: -5})'), {'n': -5});
+      expect(engine.evaluate('[-1, -2, 3]'), [-1, -2, 3]);
     });
 
     test('对象与数组（走 JSON 编组路径）', () {
@@ -143,12 +153,36 @@ void main() {
   });
 
   group('模块求值', () {
-    test('evaluateModule 执行并返回结果', () {
+    // evaluateModule 返回的是**模块命名空间对象**（不是 default 导出值）——
+    // 爬虫源的正确用法是靠副作用注册全局（见 DsPlayer 的 js_spider.dart：
+    // `_engine.evaluateModule(src, fileName: api)` 忽略返回值），所以这里
+    // 验的是「模块体真的执行了 + 返回命名空间」而非取 default。
+    test('执行模块体（副作用注册全局）', () {
+      final out = engine.evaluateModule(
+        'globalThis.moduleRan = true;',
+        fileName: 'side_effect.js',
+      );
+      expect(engine.getGlobalProperty('moduleRan'), isTrue,
+          reason: '模块体应已执行');
+      expect(out, isA<Map>(), reason: '返回模块命名空间对象');
+    });
+
+    test('export default 可从返回的命名空间读取', () {
       final out = engine.evaluateModule(
         'export default 6 * 7;',
-        fileName: 'test_module.js',
+        fileName: 'default_export.js',
       );
-      expect(out, 42);
+      expect(out, isA<Map>());
+      expect((out! as Map)['default'], 42);
+    });
+
+    test('模块内可调用宿主函数（爬虫源核心路径）', () {
+      engine.registerFunction('hostEcho', (args) => {'echo': args.first});
+      engine.evaluateModule(
+        'globalThis.got = hostEcho("hi");',
+        fileName: 'host_call.js',
+      );
+      expect(engine.getGlobalProperty('got'), {'echo': 'hi'});
     });
   });
 }
