@@ -179,13 +179,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: 'stable'
-          cache: false
-
-      # MSYS2/MinGW-w64：CMakeLists 为 MinGW 写了兼容补丁，须用 GNU 工具链
+      # MSYS2/MinGW-w64：CMakeLists 为 MinGW 写了兼容补丁，须用 GNU 工具链。
+      # **Go 必须用 MSYS2 包**（而非 actions/setup-go）：ext/CMakeLists 用
+      # `find_program(go)` 在 CMake 进程内查找，setup-go 装的是 Windows 版且
+      # PATH 不进 MSYS2 shell —— 找不到就静默回退「系统 OpenSSL」，而 MinGW
+      # 环境没有 OpenSSL，于是链接期爆一片 `undefined reference to EVP_*`
+      # （2026-09-21 CI 实锤）。Go 是 BoringSSL 源码编译的必需项。
       - name: Setup MinGW
         uses: msys2/setup-msys2@v2
         with:
@@ -195,12 +194,18 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-go
 
       - name: Configure
         shell: msys2 {0}
         run: |
+          set -e
+          # 断言 Go 可见：缺失会静默回退系统 OpenSSL，直到链接期才暴露
+          command -v go || { echo "MSYS2 内找不到 go（BoringSSL 编译必需）"; exit 1; }
+          go version
           cmake -S . -B build/windows-x64 -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DQJS_USE_BORINGSSL_SOURCE=ON \
             -DBUILD_TESTING=OFF
 
       - name: Build
