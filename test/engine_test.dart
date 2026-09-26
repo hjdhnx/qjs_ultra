@@ -418,7 +418,9 @@ bool _containsBytes(List<int> haystack, List<int> needle) {
   return false;
 }
 
-/// 定位动态库：环境变量优先，其次仓内约定路径。
+/// 定位动态库：环境变量优先，其次仓内约定路径（供其他测试文件复用）。
+String? resolveLibPath() => _resolveLib();
+
 String? _resolveLib() {
   final env = Platform.environment['QJS_ULTRA_LIB'];
   if (env != null && env.isNotEmpty && File(env).existsSync()) return env;

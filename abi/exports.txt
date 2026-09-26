@@ -31,6 +31,8 @@ qjs_get_exception_details
 qjs_get_float64
 qjs_get_global
 qjs_get_int32
+qjs_get_promise_result
+qjs_get_promise_state
 qjs_get_prop
 qjs_get_prop_u32
 qjs_get_tag
@@ -51,13 +53,12 @@ qjs_new_context
 qjs_new_date
 qjs_new_host_function
 qjs_new_object
+qjs_new_pending_promise
 qjs_new_runtime
 qjs_new_string
 qjs_own_property_names
 qjs_parse_json
 qjs_poll_rejection
-qjs_get_promise_result
-qjs_get_promise_state
 qjs_register_function
 qjs_request_interrupt
 qjs_run_gc
@@ -68,6 +69,7 @@ qjs_set_max_stack_size
 qjs_set_memory_limit
 qjs_set_prop
 qjs_set_prop_u32
+qjs_settle_pending
 qjs_stringify
 qjs_throw_error
 qjs_to_cstring

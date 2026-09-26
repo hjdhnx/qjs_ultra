@@ -58,7 +58,18 @@ typedef struct QjsCallbacks {
   QJSHostCall host_call;
   QJSModuleLoad module_load;
   QJSNormalize normalize;
+  /* 异步桥 in-flight pending promise 表（qjs_new_pending_promise/settle）。
+   * 单链表即可：in-flight 数 = 并发 bridge 调用数，量级很小。 */
+  struct QjsPending *pendings;
+  int32_t next_pending_id;
 } QjsCallbacks;
+
+typedef struct QjsPending {
+  int32_t id;
+  JSValue resolve;
+  JSValue reject;
+  struct QjsPending *next;
+} QjsPending;
 
 static QjsCallbacks *callbacks_of(JSContext *ctx) {
   return (QjsCallbacks *)JS_GetContextOpaque(ctx);
@@ -72,11 +83,8 @@ QJS_API void qjs_set_callbacks(void *ctx_ptr, QJSHostCall host_call,
   if (!ctx) return;
   QjsCallbacks *cb = callbacks_of(ctx);
   if (!cb) {
-    cb = (QjsCallbacks *)malloc(sizeof(QjsCallbacks));
+    cb = (QjsCallbacks *)calloc(1, sizeof(QjsCallbacks));
     if (!cb) return;
-    cb->host_call = NULL;
-    cb->module_load = NULL;
-    cb->normalize = NULL;
     JS_SetContextOpaque(ctx, cb);
   }
   cb->host_call = host_call;
@@ -84,12 +92,22 @@ QJS_API void qjs_set_callbacks(void *ctx_ptr, QJSHostCall host_call,
   cb->normalize = normalize;
 }
 
-/* 释放回调表（Dart dispose 在 qjs_free_context 之前调用） */
+/* 释放回调表（Dart dispose 在 qjs_free_context 之前调用）。
+ * in-flight pending promise 一并释放引用——此后 qjs_settle_pending 返回
+ * -1（Dart 侧 in-flight Future 完成时静默忽略即可，engine 已废弃）。 */
 QJS_API void qjs_clear_callbacks(void *ctx_ptr) {
   JSContext *ctx = (JSContext *)ctx_ptr;
   if (!ctx) return;
   QjsCallbacks *cb = callbacks_of(ctx);
   if (cb) {
+    QjsPending *p = cb->pendings;
+    while (p) {
+      QjsPending *next = p->next;
+      JS_FreeValue(ctx, p->resolve);
+      JS_FreeValue(ctx, p->reject);
+      free(p);
+      p = next;
+    }
     free(cb);
     JS_SetContextOpaque(ctx, NULL);
   }
@@ -987,4 +1005,69 @@ QJS_API int32_t qjs_new_bigint(JSContext *ctx, const char *dec, int32_t len,
   JS_FreeValue(ctx, arg);
   JS_FreeValue(ctx, ctor);
   return JS_IsException(*out) ? -1 : 0;
+}
+
+/* ---------- 异步桥（fjs bridge_call 语义的同步宿主移植） ----------
+ *
+ * 用法（Dart 侧 registerAsyncFunction）：
+ *   1. JS 调宿主函数 → Dart trampoline 内调 qjs_new_pending_promise：
+ *      promise 同步返回给 JS（JS 侧 await 让出），resolve/reject 函数入
+ *      per-ctx 表，id 回传 Dart；
+ *   2. Dart 异步任务（HttpClient 等）完成 → qjs_settle_pending 按 id
+ *      调用 resolve/reject（value 引用移交引擎）→ 宿主泵微任务推进
+ *      await 链；
+ *   3. 本层不泵 job——泵的时机与异常策略归 Dart（前台抛/后台记）。
+ */
+
+/* 创建 pending promise。out_promise 给 JS await；out_id 供 settle。
+ * 返回 0 成功；-1 失败（无回调表/分配失败/引擎异常已挂）。 */
+QJS_API int32_t qjs_new_pending_promise(JSContext *ctx, JSValue *out_promise,
+                                        int32_t *out_id) {
+  QjsCallbacks *cb = callbacks_of(ctx);
+  if (!cb) return -1;
+  JSValue resolving[2];
+  JSValue promise = JS_NewPromiseCapability(ctx, resolving);
+  if (JS_IsException(promise)) return -1;
+  QjsPending *p = (QjsPending *)malloc(sizeof(QjsPending));
+  if (!p) {
+    JS_FreeValue(ctx, resolving[0]);
+    JS_FreeValue(ctx, resolving[1]);
+    JS_FreeValue(ctx, promise);
+    return -1;
+  }
+  p->id = cb->next_pending_id++;
+  p->resolve = resolving[0];
+  p->reject = resolving[1];
+  p->next = cb->pendings;
+  cb->pendings = p;
+  *out_promise = promise;
+  *out_id = p->id;
+  return 0;
+}
+
+/* settle in-flight promise：ok=1 resolve / 0 reject。
+ * value 引用移交引擎（调用方不得再用）。id 不存在（已 clear/重复 settle）
+ * 返回 -1 且不动 value（调用方自行 free——engine 已废弃的场景可忽略）。
+ * 成功返回 0。本层不泵 job。 */
+QJS_API int32_t qjs_settle_pending(JSContext *ctx, int32_t id, int32_t ok,
+                                   JSValue *value) {
+  QjsCallbacks *cb = callbacks_of(ctx);
+  if (!cb) return -1;
+  QjsPending **pp = &cb->pendings;
+  while (*pp && (*pp)->id != id) pp = &(*pp)->next;
+  QjsPending *p = *pp;
+  if (!p) return -1;
+  *pp = p->next;
+  JSValue fn = ok ? p->resolve : p->reject;
+  JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)value);
+  JS_FreeValue(ctx, p->resolve);
+  JS_FreeValue(ctx, p->reject);
+  free(p);
+  if (JS_IsException(r)) {
+    /* resolve 调用自身不该抛；万一（代理包装等）清残留防串场 */
+    JSValue exc = JS_GetException(ctx);
+    JS_FreeValue(ctx, exc);
+    return -1;
+  }
+  return 0;
 }

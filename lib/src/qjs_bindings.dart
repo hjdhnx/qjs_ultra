@@ -366,6 +366,16 @@ class QjsBridge {
                 Int32 Function(Pointer<Void>, Pointer<Utf8>, Int32,
                     Pointer<QjsValue>)>>('qjs_new_bigint')
         .asFunction();
+    newPendingPromise = _lk<
+            NativeFunction<
+                Int32 Function(Pointer<Void>, Pointer<QjsValue>,
+                    Pointer<Int32>)>>('qjs_new_pending_promise')
+        .asFunction();
+    settlePending = _lk<
+            NativeFunction<
+                Int32 Function(Pointer<Void>, Int32, Int32,
+                    Pointer<QjsValue>)>>('qjs_settle_pending')
+        .asFunction();
   }
 
   /// 释放 Dart 侧的 JSValue 槽内存。
@@ -469,6 +479,10 @@ class QjsBridge {
       getDateMs;
   late final int Function(
       Pointer<Void>, Pointer<Utf8>, int, Pointer<QjsValue>) newBigInt;
+  late final int Function(
+      Pointer<Void>, Pointer<QjsValue>, Pointer<Int32>) newPendingPromise;
+  late final int Function(
+      Pointer<Void>, int, int, Pointer<QjsValue>) settlePending;
 
   static QjsBridge? _instance;
 

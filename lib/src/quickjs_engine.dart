@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:typed_data';
@@ -431,38 +432,51 @@ class QuickjsEngine implements JsEngine {
     }
   }
 
+  /// 同步调用 JS 函数，返回**结果槽**（调用方负责 freeValue/freeSlot）。
+  /// rc != 0 时抛结构化异常。供 [_callSlot] / [_callSlotAsync] 复用。
+  Pointer<QjsValue> _callRaw(Pointer<QjsValue> funcSlot, List<Object?> args) {
+    final argv = calloc<QjsValue>(args.isEmpty ? 1 : args.length);
+    var out = Pointer<QjsValue>.fromAddress(0);
+    try {
+      for (var i = 0; i < args.length; i++) {
+        _dartToJs(args[i], argv + i);
+      }
+      out = _newSlot();
+      final rc = _bridge.call(
+        _ctxPointer,
+        funcSlot,
+        nullptr,
+        args.length,
+        argv,
+        out,
+      );
+      if (rc != 0) {
+        _bridge.freeSlot(out);
+        out = Pointer<QjsValue>.fromAddress(0);
+        throw _takeException();
+      }
+      final result = out;
+      out = Pointer<QjsValue>.fromAddress(0);
+      return result;
+    } finally {
+      if (out.address != 0) _bridge.freeSlot(out);
+      for (var i = 0; i < args.length; i++) {
+        _bridge.freeValue(_ctxPointer, argv + i);
+      }
+      malloc.free(argv);
+    }
+  }
+
   Object? _callSlot(Pointer<QjsValue> funcSlot, List<Object?> args) =>
       _runGuarded(() {
-        final argv = calloc<QjsValue>(args.isEmpty ? 1 : args.length);
+        final out = _callRaw(funcSlot, args);
         try {
-          for (var i = 0; i < args.length; i++) {
-            _dartToJs(args[i], argv + i);
-          }
-          final out = _newSlot();
-          try {
-            final rc = _bridge.call(
-              _ctxPointer,
-              funcSlot,
-              nullptr,
-              args.length,
-              argv,
-              out,
-            );
-            if (rc != 0) {
-              throw _takeException();
-            }
-            final result = _resolveResult(out);
-            _drainJobs();
-            return result;
-          } finally {
-            _bridge.freeValue(_ctxPointer, out);
-            _bridge.freeSlot(out);
-          }
+          final result = _resolveResult(out);
+          _drainJobs();
+          return result;
         } finally {
-          for (var i = 0; i < args.length; i++) {
-            _bridge.freeValue(_ctxPointer, argv + i);
-          }
-          malloc.free(argv);
+          _bridge.freeValue(_ctxPointer, out);
+          _bridge.freeSlot(out);
         }
       });
 
@@ -561,6 +575,316 @@ class QuickjsEngine implements JsEngine {
         ..free(out)
         ..free(dropped);
     }
+  }
+
+  // ---------- 异步桥（fjs bridge_call 语义的同步宿主移植） ----------
+  //
+  // JS 语义：`const r = await fn(args...)`。宿主函数被 JS 调用时同步创建
+  // pending promise 返回（JS await 让出，引擎不被阻塞），Dart 侧 Future
+  // 完成后经 qjs_settle_pending 唤醒并泵微任务推进 await 链。in-flight
+  // 调用期间 evaluateAsync/callAsync 的前台泵循环挂起等待（fjs 前台等待
+  // + 后台兜底两层模型的单 isolate 版）。
+
+  final _asyncInFlight = <int>{};
+  Completer<void>? _activitySignal;
+  final _backgroundErrors = <String>[];
+  bool _pumping = false;
+  var _nextTimerId = 1;
+  final _timers = <int, Timer>{};
+
+  /// 注册异步宿主函数为 JS 全局函数。返回值走 JSON-like 契约
+  /// （Map/List/String/num/bool/null/Uint8List/DateTime）。
+  void registerAsyncFunction(
+      String name, Future<Object?> Function(List<Object?> args) fn) {
+    registerFunction(name, (args) {
+      final promise = _newSlot();
+      final idPtr = malloc<Int32>();
+      try {
+        final rc = _bridge.newPendingPromise(_ctxPointer, promise, idPtr);
+        if (rc != 0) throw _takeException();
+        final pid = idPtr.value;
+        _asyncInFlight.add(pid);
+        unawaited(_runAsyncBridge(fn, pid, args));
+        return _PendingPromiseHandle(promise);
+      } finally {
+        malloc.free(idPtr);
+      }
+    });
+  }
+
+  Future<void> _runAsyncBridge(
+      Future<Object?> Function(List<Object?> args) fn, int pid,
+      List<Object?> args) async {
+    var ok = 1;
+    final value = _newSlot();
+    try {
+      try {
+        _dartToJs(await fn(args), value);
+      } catch (e) {
+        ok = 0;
+        final msgPtr = e.toString().toNativeUtf8();
+        try {
+          _bridge.newString(_ctxPointer, msgPtr, _utf8Len(e.toString()), value);
+        } finally {
+          malloc.free(msgPtr);
+        }
+      }
+      if (_bridge.settlePending(_ctxPointer, pid, ok, value) != 0) {
+        // 表已清（engine 已 dispose）：引用自释放，静默收场
+        _bridge.freeValue(_ctxPointer, value);
+      }
+    } finally {
+      _bridge.freeSlot(value);
+    }
+    _pumpUntilIdle(); // settle 后泵微任务，推进 JS await 链
+    _asyncInFlight.remove(pid);
+    _signalActivity();
+  }
+
+  /// 后台泵：job 异常吞进 [drainBackgroundErrors]（无前台调用方可抛）。
+  /// 重入保护：泵中触发的新 job 由外层循环继续消费（单 isolate 无并发）。
+  void _pumpUntilIdle() {
+    if (_pumping) return;
+    _pumping = true;
+    try {
+      for (;;) {
+        final rc = _bridge.executePendingJob(_rt);
+        if (rc == 0) return;
+        if (rc < 0) _backgroundErrors.add(_takeException().toString());
+      }
+    } finally {
+      _pumping = false;
+    }
+  }
+
+  Future<void> _waitForActivity() =>
+      (_activitySignal ??= Completer<void>()).future;
+
+  void _signalActivity() {
+    final c = _activitySignal;
+    _activitySignal = null;
+    c?.complete();
+  }
+
+  /// 异步求值（fjs 前台等待语义）：结果为 promise 时泵微任务并等待
+  /// in-flight 异步宿主调用直至 settle；rejected 抛 [JsEvalException]。
+  /// 队空仍 pending（等的是未注册的异步源）返回 null。
+  Future<Object?> evaluateAsync(String script,
+      {String? fileName, int flags = QjsEvalFlags.global}) {
+    _checkDisposed();
+    return _runGuardedAsync(() async {
+      final scriptPtr = script.toNativeUtf8();
+      final namePtr = (fileName ?? 'script.js').toNativeUtf8();
+      final out = _newSlot();
+      try {
+        final rc = _bridge.eval(
+            _ctxPointer, scriptPtr, _utf8Len(script), namePtr, flags, out);
+        if (rc != 0) throw _takeException();
+        final result = await _resolveResultAsync(out);
+        _pumpUntilIdle();
+        return result;
+      } finally {
+        _bridge.freeValue(_ctxPointer, out);
+        _bridge.freeSlot(out);
+        malloc
+          ..free(scriptPtr)
+          ..free(namePtr);
+      }
+    });
+  }
+
+  /// 异步调用 JS 函数（[callFunction] 的 async 版，promise 语义同
+  /// [evaluateAsync]）。drpy3 六环节调度入口。
+  Future<Object?> callAsync(Object? fn, List<Object?> args) {
+    _checkDisposed();
+    return _runGuardedAsync(() async {
+      switch (fn) {
+        case JsFunctionRef ref:
+          return _callSlotAsync(ref.slot, args);
+        case String name:
+          final target = getGlobalProperty(name);
+          if (target is JsFunctionRef) {
+            try {
+              return await _callSlotAsync(target.slot, args);
+            } finally {
+              target.close();
+              _openFunctionRefs.remove(target);
+            }
+          }
+          throw StateError('全局属性 $name 不是函数');
+        default:
+          throw StateError('callAsync 只接受 JsFunctionRef 或全局函数名');
+      }
+    });
+  }
+
+  Future<Object?> _callSlotAsync(
+      Pointer<QjsValue> funcSlot, List<Object?> args) async {
+    final out = _callRaw(funcSlot, args);
+    try {
+      final result = await _resolveResultAsync(out);
+      _pumpUntilIdle();
+      return result;
+    } finally {
+      _bridge.freeValue(_ctxPointer, out);
+      _bridge.freeSlot(out);
+    }
+  }
+
+  Future<Object?> _resolveResultAsync(Pointer<QjsValue> slot) async {
+    var state = _bridge.getPromiseState(_ctxPointer, slot);
+    if (state < 0) return _jsToDart(slot, _Conv());
+    while (state == 0) {
+      _pumpForeground();
+      state = _bridge.getPromiseState(_ctxPointer, slot);
+      if (state != 0) break;
+      if (_asyncInFlight.isNotEmpty) {
+        await _waitForActivity();
+        continue;
+      }
+      break;
+    }
+    if (state == 0) return null;
+    final result = _newSlot();
+    try {
+      _bridge.getPromiseResult(_ctxPointer, slot, result);
+      if (state == 2) throw _exceptionFromValue(result);
+      return _jsToDart(result, _Conv());
+    } finally {
+      _bridge.freeValue(_ctxPointer, result);
+      _bridge.freeSlot(result);
+    }
+  }
+
+  /// 前台泵：job 异常抛给当前调用方（与 [_pumpUntilIdle] 的差异点）。
+  void _pumpForeground() {
+    for (;;) {
+      final rc = _bridge.executePendingJob(_rt);
+      if (rc == 0) return;
+      if (rc < 0) throw _takeException();
+    }
+  }
+
+  Future<T> _runGuardedAsync<T>(Future<T> Function() body) async {
+    final timeout = _config.timeoutMs;
+    final useDeadline = timeout != null && timeout > 0;
+    if (useDeadline) {
+      _deadlineActive = true;
+      _bridge.setDeadline(
+          _rt, DateTime.now().millisecondsSinceEpoch + timeout);
+    }
+    try {
+      return await body();
+    } finally {
+      if (useDeadline) {
+        _deadlineActive = false;
+        _bridge.setDeadline(_rt, 0);
+      }
+    }
+  }
+
+  /// 排空后台错误（后台泵吞掉的 job 异常 + timer 回调异常）。
+  List<String> drainBackgroundErrors() {
+    final out = List<String>.of(_backgroundErrors);
+    _backgroundErrors.clear();
+    return out;
+  }
+
+  /// 安装 setTimeout/clearTimeout 宿主实现（Dart Timer 驱动）。回调经
+  /// [callAsync] 执行：回调内 await 异步宿主函数可正常驱动；回调异常进
+  /// 后台错误（对齐 fjs guarded timers 语义）。setInterval 未提供
+  /// （drpy3 bundle 无引用；需要时再加）。
+  void installTimers() {
+    registerFunction('__qjs_setTimeout', (args) {
+      final fn = args.isNotEmpty ? args[0] : null;
+      final ms = args.length > 1 ? (args[1] as num?)?.toInt() ?? 0 : 0;
+      if (fn is! JsFunctionRef) return 0;
+      final id = _nextTimerId++;
+      _timers[id] = Timer(Duration(milliseconds: ms), () {
+        _timers.remove(id);
+        unawaited(_fireTimer(fn));
+      });
+      return id;
+    });
+    registerFunction('__qjs_clearTimeout', (args) {
+      final id = args.isNotEmpty ? args[0] as num? : null;
+      _timers.remove(id?.toInt() ?? 0)?.cancel();
+      return null;
+    });
+    evaluate(
+      'globalThis.setTimeout = (fn, ms) => __qjs_setTimeout(fn, ms ?? 0);'
+      'globalThis.clearTimeout = (id) => __qjs_clearTimeout(id);',
+    );
+  }
+
+  Future<void> _fireTimer(JsFunctionRef fn) async {
+    try {
+      await callAsync(fn, const []);
+    } catch (e) {
+      _backgroundErrors.add('timer: $e');
+    }
+  }
+
+  /// drpy3 bundle 装载前置垫片：globalThis.fjs 桥（bundle **原样复用，
+  /// 零改包**）、atob/btoa 兜底、timers。[bridge] 收到 bundle 发来的
+  /// `{action, ...}` 消息（req/loadAsset/getProxy/evalModule 协议与
+  /// DsPlayer Drpy3BridgeHandlers 完全一致）。须在装载 bundle 之前调用。
+  void installDrpy3Shim(Future<Object?> Function(Object? message) bridge) {
+    registerAsyncFunction('__qjs_bridge_call', (args) => bridge(args.first));
+    installTimers();
+    evaluate('''
+globalThis.fjs = { bridge_call: (msg) => globalThis.__qjs_bridge_call(msg) };
+if (typeof globalThis.atob === 'undefined') {
+  globalThis.atob = (s) => {
+    const bytes = [];
+    for (let i = 0; i < s.length; i++) bytes.push(s.charCodeAt(i) & 0xff);
+    return Buffer.from(bytes).toString('base64');
+  };
+}
+if (typeof globalThis.btoa === 'undefined') {
+  globalThis.btoa = (s) => {
+    const bin = Buffer.from(String(s), 'base64');
+    let out = '';
+    for (let i = 0; i < bin.length; i++) out += String.fromCharCode(bin[i]);
+    return out;
+  };
+}
+''');
+  }
+
+  /// 装载 ESM 模块源码（经内置模块表）并把 [exports] 导出挂为
+  /// `__<导出名>` 全局函数——qjs_ultra 没有 rquickjs 的
+  /// `engine.call(module, method)` 调度面，drpy3 六环节经此暴露
+  /// （callAsync('__drpy3Call', ...)）。含顶层 await 的模块会等到装载完成。
+  Future<void> loadModuleToGlobals(
+    String moduleName,
+    String source, {
+    List<String> exports = const [
+      'drpy3Setup',
+      'drpy3Load',
+      'drpy3Call',
+      'drpy3Capabilities',
+      'drpy3Sweep',
+      'drpy3StoreExport',
+      'drpy3StoreImport',
+    ],
+  }) {
+    final existing = _moduleLoader;
+    if (existing == null) {
+      _moduleLoader = _InlineModuleLoader({moduleName: source});
+    } else if (existing is _InlineModuleLoader) {
+      existing.modules[moduleName] = source;
+    } else {
+      throw StateError('loadModuleToGlobals 与自定义 JsModuleLoader 冲突');
+    }
+    final attach = exports.map((e) => 'g.__$e = m.$e;').join('\n  ');
+    return evaluateAsync('''
+(async () => {
+  const m = await import('$moduleName');
+  const g = globalThis;
+  $attach
+})()
+''');
   }
 
   @override
@@ -931,6 +1255,10 @@ class QuickjsEngine implements JsEngine {
         _bridge.makeUndefined(out);
       case bool b:
         _bridge.makeBool(_ctxPointer, out, b ? 1 : 0);
+      case _PendingPromiseHandle h:
+        // 异步桥返回通道：promise 引用移交 out，载体槽立即释放
+        _bridge.valueMove(out, h.slot);
+        _bridge.freeSlot(h.slot);
       case DateTime d:
         _bridge.newDate(_ctxPointer, d.millisecondsSinceEpoch.toDouble(), out);
       case int i:
@@ -1219,4 +1547,28 @@ class _Conv {
   int depth = 0;
   int nodes = 0;
   final active = <int>{};
+}
+
+/// 异步桥的 pending promise 载体：宿主函数返回值通道中把 promise 引用
+/// 移交给 JS（[_dartToJs] 消费后槽内存即释放）。
+class _PendingPromiseHandle {
+  _PendingPromiseHandle(this.slot);
+  final Pointer<QjsValue> slot;
+}
+
+/// loadModuleToGlobals 的内置模块表（名字 → 源码）。bundle 已被 esbuild
+/// 打平，动态 import 只命中精确模块名，无需相对解析。
+class _InlineModuleLoader implements JsModuleLoader {
+  _InlineModuleLoader(this.modules);
+  final Map<String, String> modules;
+
+  @override
+  Uint8List? getModuleBytecode(String moduleName) => null;
+
+  @override
+  String? getModuleSource(String moduleName) => modules[moduleName];
+
+  @override
+  String normalizeName(String moduleBaseName, String moduleName) =>
+      moduleName;
 }
