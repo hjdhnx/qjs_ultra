@@ -199,18 +199,18 @@ class QuickjsEngine implements JsEngine {
   /// [JsEvalException]；队空仍 pending（在等宿主异步，本契约不支持）时
   /// 返回 null——promise 无 JSON-like Dart 表示。
   Object? _resolveResult(Pointer<QjsValue> slot) {
-    var state = _bridge.promiseState(_ctxPointer, slot);
+    var state = _bridge.getPromiseState(_ctxPointer, slot);
     if (state < 0) return _jsToDart(slot, _Conv());
     while (state == 0) {
       final rc = _bridge.executePendingJob(_rt);
       if (rc < 0) throw _takeException();
       if (rc == 0) break;
-      state = _bridge.promiseState(_ctxPointer, slot);
+      state = _bridge.getPromiseState(_ctxPointer, slot);
     }
     if (state == 0) return null;
     final result = _newSlot();
     try {
-      _bridge.promiseResult(_ctxPointer, slot, result);
+      _bridge.getPromiseResult(_ctxPointer, slot, result);
       if (state == 2) throw _exceptionFromValue(result);
       return _jsToDart(result, _Conv());
     } finally {

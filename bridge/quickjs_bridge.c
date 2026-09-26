@@ -136,8 +136,9 @@ static int64_t qjs_now_ms(void) {
 }
 #else
 static int64_t qjs_now_ms(void) {
+  /* bionic（android-24）无 timespec_get，clock_gettime 全平台可用 */
   struct timespec ts;
-  if (timespec_get(&ts, TIME_UTC) != TIME_UTC) return 0;
+  if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 #endif
@@ -917,8 +918,10 @@ QJS_API int32_t qjs_get_exception_details(JSContext *ctx, char **out_name,
   return 0;
 }
 
-/* JS_PromiseState 透传：-1 非 promise，0 pending，1 fulfilled，2 rejected */
-QJS_API int32_t qjs_promise_state(JSContext *ctx, JSValue *v) {
+/* JS_PromiseState 透传：-1 非 promise，0 pending，1 fulfilled，2 rejected。
+ * 命名避开扩展层 qjs_utils.c 的 qjs_promise_result（fs 模块内部
+ * async trampoline，同名不同物）。 */
+QJS_API int32_t qjs_get_promise_state(JSContext *ctx, JSValue *v) {
   switch (JS_PromiseState(ctx, *v)) {
     case JS_PROMISE_PENDING: return 0;
     case JS_PROMISE_FULFILLED: return 1;
@@ -929,8 +932,9 @@ QJS_API int32_t qjs_promise_state(JSContext *ctx, JSValue *v) {
 
 /* 取 promise 的 settle 结果（fulfilled value / rejected reason）。
  * JS_PromiseResult 内部已 Dup，返回值引用直接移交调用方。 */
-QJS_API int32_t qjs_promise_result(JSContext *ctx, JSValue *v, JSValue *out) {
-  int state = qjs_promise_state(ctx, v);
+QJS_API int32_t qjs_get_promise_result(JSContext *ctx, JSValue *v,
+                                       JSValue *out) {
+  int state = qjs_get_promise_state(ctx, v);
   if (state <= 0) {
     *out = JS_UNDEFINED;
     return -1;

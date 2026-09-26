@@ -56,8 +56,8 @@ qjs_new_string
 qjs_own_property_names
 qjs_parse_json
 qjs_poll_rejection
-qjs_promise_result
-qjs_promise_state
+qjs_get_promise_result
+qjs_get_promise_state
 qjs_register_function
 qjs_request_interrupt
 qjs_run_gc

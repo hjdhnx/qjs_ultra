@@ -343,13 +343,13 @@ class QjsBridge {
                     Pointer<Pointer<Utf8>>,
                     Pointer<Pointer<Utf8>>)>>('qjs_get_exception_details')
         .asFunction();
-    promiseState = _lk<NativeFunction<Int32 Function(Pointer<Void>,
-            Pointer<QjsValue>)>>('qjs_promise_state')
+    getPromiseState = _lk<NativeFunction<Int32 Function(Pointer<Void>,
+            Pointer<QjsValue>)>>('qjs_get_promise_state')
         .asFunction();
-    promiseResult = _lk<
+    getPromiseResult = _lk<
             NativeFunction<
                 Int32 Function(Pointer<Void>, Pointer<QjsValue>,
-                    Pointer<QjsValue>)>>('qjs_promise_result')
+                    Pointer<QjsValue>)>>('qjs_get_promise_result')
         .asFunction();
     newDate = _lk<
             NativeFunction<
@@ -461,9 +461,9 @@ class QjsBridge {
   late final void Function(Pointer<Void>, int) setGcThreshold;
   late final int Function(Pointer<Void>, Pointer<Pointer<Utf8>>,
       Pointer<Pointer<Utf8>>, Pointer<Pointer<Utf8>>) getExceptionDetails;
-  late final int Function(Pointer<Void>, Pointer<QjsValue>) promiseState;
+  late final int Function(Pointer<Void>, Pointer<QjsValue>) getPromiseState;
   late final int Function(
-      Pointer<Void>, Pointer<QjsValue>, Pointer<QjsValue>) promiseResult;
+      Pointer<Void>, Pointer<QjsValue>, Pointer<QjsValue>) getPromiseResult;
   late final int Function(Pointer<Void>, double, Pointer<QjsValue>) newDate;
   late final int Function(Pointer<Void>, Pointer<QjsValue>, Pointer<Double>)
       getDateMs;
