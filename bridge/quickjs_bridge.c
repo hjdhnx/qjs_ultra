@@ -15,6 +15,16 @@
 #include "quickjs.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <time.h>
+
+#if defined(__STDC_NO_ATOMICS__)
+/* 极少数 C11 库无 atomics：本仓目标工具链（NDK clang / MinGW gcc）均支持，
+ * 真走到这里说明工具链异常，直接编不过比静默退化安全 */
+#error "stdatomic.h required"
+#else
+#include <stdatomic.h>
+#endif
 
 #if defined(_WIN32)
 #define QJS_API __declspec(dllexport)
@@ -87,9 +97,168 @@ QJS_API void qjs_clear_callbacks(void *ctx_ptr) {
 
 /* ---------- runtime / context ---------- */
 
+/* ---------- 运行时控制块：中断/超时 + 未处理 rejection 管道 ----------
+ *
+ * 设计对齐 fjs（fluttercandies/fjs）的 shutdown.rs + error_sink.rs：
+ * 1. JS_SetInterruptHandler 挂一个控制块，检查「手动中断旗」或「墙钟截止
+ *    时间」。宿主（Dart）同步调用模型里起不了 Timer（eval 阻塞 isolate，
+ *    Timer 永不触发），超时必须由 C 侧 handler 在 JS 执行间隙查墙钟——
+ *    死循环 while(true){} 也能被打断成可捕获的 JS 异常，而不是卡死线程。
+ * 2. JS_SetHostPromiseRejectionTracker 把未处理 rejection 格式化成纯文本
+ *    进 per-runtime 有界环形队列（不持 JS 值，不阻碍 GC）。Dart 侧经
+ *    qjs_poll_rejection 排空。不做 fjs 的「身份撤单/checkpoint 差集」——
+ *    那是为异步 select 场景设计的，本层同步模型里 rejection 一旦入队
+ *    就是最终事实，无重放问题。
+ */
+#define QJS_REJ_CAP 32
+
+typedef struct QjsRuntimeCtl {
+  atomic_int interrupt;          /* 1 = 立即中断当前 JS 执行 */
+  atomic_int has_deadline;       /* 1 = deadline_ms 有效 */
+  atomic_llong deadline_ms;      /* unix 毫秒墙钟截止时间 */
+  char *rej[QJS_REJ_CAP];        /* 未处理 rejection 文本环形队列 */
+  int rej_head;
+  int rej_count;
+  uint64_t rej_dropped;          /* 队满后被丢弃的条数（累计） */
+} QjsRuntimeCtl;
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+/* FILETIME 是 1601-01-01 起 100ns；换算 unix 毫秒 */
+static int64_t qjs_now_ms(void) {
+  FILETIME ft;
+  ULARGE_INTEGER u;
+  GetSystemTimeAsFileTime(&ft);
+  u.LowPart = ft.dwLowDateTime;
+  u.HighPart = ft.dwHighDateTime;
+  return (int64_t)(u.QuadPart / 10000) - 11644473600000LL;
+}
+#else
+static int64_t qjs_now_ms(void) {
+  struct timespec ts;
+  if (timespec_get(&ts, TIME_UTC) != TIME_UTC) return 0;
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+#endif
+
+static int qjs_interrupt_handler(JSRuntime *rt, void *opaque) {
+  QjsRuntimeCtl *ctl = (QjsRuntimeCtl *)opaque;
+  (void)rt;
+  if (!ctl) return 0;
+  if (atomic_load(&ctl->interrupt)) return 1;
+  if (atomic_load(&ctl->has_deadline)) {
+    int64_t dl = atomic_load(&ctl->deadline_ms);
+    if (dl > 0 && qjs_now_ms() > dl) return 1;
+  }
+  return 0;
+}
+
+/* 格式化 rejection reason 为文本（Error 对象产出 "Error: msg" 形式）。
+ * reason 的 toString 可能本身抛异常——必须清掉残留，否则污染后续操作。
+ * qjs_to_cstring 定义在下方值操作区，此处前向声明。 */
+QJS_API int32_t qjs_to_cstring(JSContext *ctx, JSValue *v, char **out,
+                               int32_t *out_len);
+
+static char *qjs_format_rejection(JSContext *ctx, JSValueConst reason) {
+  JSValue v = (JSValue)reason;
+  char *out = NULL;
+  int32_t out_len = 0;
+  if (qjs_to_cstring(ctx, &v, &out, &out_len) != 0) {
+    JSValue exc = JS_GetException(ctx);
+    JS_FreeValue(ctx, exc);
+    return NULL;
+  }
+  return out;
+}
+
+static void qjs_rejection_tracker(JSContext *ctx, JSValueConst promise,
+                                  JSValueConst reason, JS_BOOL is_handled,
+                                  void *opaque) {
+  QjsRuntimeCtl *ctl = (QjsRuntimeCtl *)opaque;
+  (void)promise;
+  if (!ctl || is_handled) return;
+  char *msg = qjs_format_rejection(ctx, reason);
+  if (!msg) return;
+  if (ctl->rej_count >= QJS_REJ_CAP) {
+    /* 队满丢最旧：错误管道是诊断用途，保新弃旧 */
+    free(ctl->rej[ctl->rej_head]);
+    ctl->rej[ctl->rej_head] = msg;
+    ctl->rej_head = (ctl->rej_head + 1) % QJS_REJ_CAP;
+    ctl->rej_dropped++;
+    return;
+  }
+  ctl->rej[(ctl->rej_head + ctl->rej_count) % QJS_REJ_CAP] = msg;
+  ctl->rej_count++;
+}
+
+/* 安装运行时控制块（幂等）：中断 handler + rejection tracker 一次挂齐。
+ * 必须在 qjs_free_runtime 之前（本层会在 free 时自动回收 ctl）。 */
+QJS_API int32_t qjs_install_runtime_ctl(JSRuntime *rt) {
+  if (!rt) return -1;
+  if (JS_GetRuntimeOpaque(rt)) return 0;
+  QjsRuntimeCtl *ctl = (QjsRuntimeCtl *)calloc(1, sizeof(QjsRuntimeCtl));
+  if (!ctl) return -1;
+  atomic_init(&ctl->interrupt, 0);
+  atomic_init(&ctl->has_deadline, 0);
+  atomic_init(&ctl->deadline_ms, 0);
+  JS_SetRuntimeOpaque(rt, ctl);
+  JS_SetInterruptHandler(rt, qjs_interrupt_handler, ctl);
+  JS_SetHostPromiseRejectionTracker(rt, qjs_rejection_tracker, ctl);
+  return 0;
+}
+
+QJS_API void qjs_request_interrupt(JSRuntime *rt) {
+  QjsRuntimeCtl *ctl = rt ? (QjsRuntimeCtl *)JS_GetRuntimeOpaque(rt) : NULL;
+  if (ctl) atomic_store(&ctl->interrupt, 1);
+}
+
+QJS_API void qjs_clear_interrupt(JSRuntime *rt) {
+  QjsRuntimeCtl *ctl = rt ? (QjsRuntimeCtl *)JS_GetRuntimeOpaque(rt) : NULL;
+  if (ctl) atomic_store(&ctl->interrupt, 0);
+}
+
+/* unix 毫秒墙钟截止时间；传 0 清除 */
+QJS_API void qjs_set_deadline(JSRuntime *rt, int64_t unix_ms) {
+  QjsRuntimeCtl *ctl = rt ? (QjsRuntimeCtl *)JS_GetRuntimeOpaque(rt) : NULL;
+  if (!ctl) return;
+  if (unix_ms <= 0) {
+    atomic_store(&ctl->has_deadline, 0);
+    atomic_store(&ctl->deadline_ms, 0);
+  } else {
+    atomic_store(&ctl->deadline_ms, unix_ms);
+    atomic_store(&ctl->has_deadline, 1);
+  }
+}
+
+/* 弹出一条未处理 rejection 文本（malloc，qjs_free_buffer 释放）。
+ * 返回 1 有（*out 有效）；0 队空。dropped 非空时带回累计丢弃数。 */
+QJS_API int32_t qjs_poll_rejection(JSRuntime *rt, char **out,
+                                   uint64_t *dropped) {
+  QjsRuntimeCtl *ctl = rt ? (QjsRuntimeCtl *)JS_GetRuntimeOpaque(rt) : NULL;
+  if (dropped && ctl) *dropped = ctl->rej_dropped;
+  if (!ctl || ctl->rej_count == 0) return 0;
+  *out = ctl->rej[ctl->rej_head];
+  ctl->rej[ctl->rej_head] = NULL;
+  ctl->rej_head = (ctl->rej_head + 1) % QJS_REJ_CAP;
+  ctl->rej_count--;
+  return 1;
+}
+
 QJS_API JSRuntime *qjs_new_runtime(void) { return JS_NewRuntime(); }
 
-QJS_API void qjs_free_runtime(JSRuntime *rt) { JS_FreeRuntime(rt); }
+QJS_API void qjs_free_runtime(JSRuntime *rt) {
+  /* 先回收控制块再释放 runtime（未安装 ctl 的旧调用方 opaque 为 NULL，无害） */
+  QjsRuntimeCtl *ctl = rt ? (QjsRuntimeCtl *)JS_GetRuntimeOpaque(rt) : NULL;
+  if (ctl) {
+    for (int i = 0; i < ctl->rej_count; i++) {
+      free(ctl->rej[(ctl->rej_head + i) % QJS_REJ_CAP]);
+    }
+    free(ctl);
+    JS_SetRuntimeOpaque(rt, NULL);
+  }
+  JS_FreeRuntime(rt);
+}
 
 QJS_API JSContext *qjs_new_context(JSRuntime *rt) { return JS_NewContext(rt); }
 
@@ -683,4 +852,135 @@ QJS_API int32_t qjs_bridge_new_uint8_array(JSContext *ctx, const uint8_t *buf,
   if (JS_IsException(v)) return -1;
   *out = v;
   return 0;
+}
+
+/* ---------- 结构化错误 / Promise / Date / BigInt（fjs 封装对齐） ---------- */
+
+QJS_API void qjs_set_gc_threshold(JSRuntime *rt, size_t threshold) {
+  JS_SetGCThreshold(rt, threshold);
+}
+
+/* 取走当前 pending 异常并拆成 name / message / stack 三段文本。
+ * 每段 malloc 分配（调用方 qjs_free_buffer），缺失为 NULL。
+ * 非 Error 对象（throw "str" 等）整体 coerce 进 *out_message。
+ * 此调用消费异常（清空 pending），与 qjs_get_exception 的语义一致。 */
+QJS_API int32_t qjs_get_exception_details(JSContext *ctx, char **out_name,
+                                          char **out_message,
+                                          char **out_stack) {
+  *out_name = NULL;
+  *out_message = NULL;
+  *out_stack = NULL;
+  JSValue exc = JS_GetException(ctx);
+  if (JS_IsNull(exc) || JS_IsUndefined(exc)) {
+    JS_FreeValue(ctx, exc);
+    return 0;
+  }
+  /* 属性读取本身抛异常（getter thrower）时清残留继续，别让异常串场 */
+  const char *fields[] = {"name", "message", "stack"};
+  char **outs[] = {out_name, out_message, out_stack};
+  for (int i = 0; i < 3; i++) {
+    JSValue fv = JS_GetPropertyStr(ctx, exc, fields[i]);
+    if (JS_IsException(fv)) {
+      JSValue pending = JS_GetException(ctx);
+      JS_FreeValue(ctx, pending);
+      continue;
+    }
+    if (JS_IsUndefined(fv)) {
+      JS_FreeValue(ctx, fv);
+      continue;
+    }
+    int32_t len = 0;
+    char *s = NULL;
+    if (qjs_to_cstring(ctx, &fv, &s, &len) != 0) {
+      JSValue pending = JS_GetException(ctx);
+      JS_FreeValue(ctx, pending);
+    } else if (s && *s) {
+      *outs[i] = s;
+    } else {
+      free(s);
+    }
+    JS_FreeValue(ctx, fv);
+  }
+  /* message 兜底：非对象异常（字符串/数字）或 Error 无 message 时 coerce 整体 */
+  if (!*out_message) {
+    int32_t len = 0;
+    char *s = NULL;
+    if (qjs_to_cstring(ctx, &exc, &s, &len) == 0 && s && *s) {
+      *out_message = s;
+    } else {
+      JSValue pending = JS_GetException(ctx);
+      JS_FreeValue(ctx, pending);
+      free(s);
+    }
+  }
+  JS_FreeValue(ctx, exc);
+  return 0;
+}
+
+/* JS_PromiseState 透传：-1 非 promise，0 pending，1 fulfilled，2 rejected */
+QJS_API int32_t qjs_promise_state(JSContext *ctx, JSValue *v) {
+  switch (JS_PromiseState(ctx, *v)) {
+    case JS_PROMISE_PENDING: return 0;
+    case JS_PROMISE_FULFILLED: return 1;
+    case JS_PROMISE_REJECTED: return 2;
+  }
+  return -1;
+}
+
+/* 取 promise 的 settle 结果（fulfilled value / rejected reason）。
+ * JS_PromiseResult 内部已 Dup，返回值引用直接移交调用方。 */
+QJS_API int32_t qjs_promise_result(JSContext *ctx, JSValue *v, JSValue *out) {
+  int state = qjs_promise_state(ctx, v);
+  if (state <= 0) {
+    *out = JS_UNDEFINED;
+    return -1;
+  }
+  *out = JS_PromiseResult(ctx, *v);
+  return 0;
+}
+
+/* new Date(ms)（Invalid Date 产出 NaN 时间值，由调用方判 NaN） */
+QJS_API int32_t qjs_new_date(JSContext *ctx, double epoch_ms, JSValue *out) {
+  *out = JS_NewDate(ctx, epoch_ms);
+  return JS_IsException(*out) ? -1 : 0;
+}
+
+/* Date 读取：借道 getTime()（快照语义，返回自 epoch 毫秒；Invalid Date 为 NaN）。
+ * 非 Date 对象返回 -1。fjs 同款做法——不碰引擎内部表示，兼容内核差异。 */
+QJS_API int32_t qjs_get_date_ms(JSContext *ctx, JSValue *v, double *out) {
+  JSValue get_time = JS_GetPropertyStr(ctx, *v, "getTime");
+  if (JS_IsException(get_time)) return -1;
+  if (!JS_IsFunction(ctx, get_time)) {
+    JS_FreeValue(ctx, get_time);
+    return -1;
+  }
+  JSValue ms = JS_Call(ctx, get_time, *v, 0, NULL);
+  JS_FreeValue(ctx, get_time);
+  if (JS_IsException(ms)) return -1;
+  int rc = JS_ToFloat64(ctx, out, ms);
+  JS_FreeValue(ctx, ms);
+  return rc < 0 ? -1 : 0;
+}
+
+/* 借道全局 BigInt(str) 构造任意精度整数（十进制文本入参，fjs 同款）。
+ * 非法文本走 JS 异常路径返回 -1。 */
+QJS_API int32_t qjs_new_bigint(JSContext *ctx, const char *dec, int32_t len,
+                               JSValue *out) {
+  JSValue global = JS_GetGlobalObject(ctx);
+  JSValue ctor = JS_GetPropertyStr(ctx, global, "BigInt");
+  JS_FreeValue(ctx, global);
+  if (JS_IsException(ctor)) return -1;
+  if (!JS_IsFunction(ctx, ctor)) {
+    JS_FreeValue(ctx, ctor);
+    return -1;
+  }
+  JSValue arg = JS_NewStringLen(ctx, dec, (size_t)len);
+  if (JS_IsException(arg)) {
+    JS_FreeValue(ctx, ctor);
+    return -1;
+  }
+  *out = JS_Call(ctx, ctor, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+  JS_FreeValue(ctx, arg);
+  JS_FreeValue(ctx, ctor);
+  return JS_IsException(*out) ? -1 : 0;
 }

@@ -18,4 +18,5 @@ library;
 export 'src/js_engine.dart'
     show JsEngine, JsEngineConfig, JsEngineFactory, JsHostFunction, JsMemoryUsage, JsModuleLoader;
 export 'src/qjs_bindings.dart' show QjsBridge, QjsTag, QjsEvalFlags, QjsValue;
-export 'src/quickjs_engine.dart' show QuickjsEngine;
+export 'src/quickjs_engine.dart'
+    show QuickjsEngine, JsEvalException, JsErrorKind, JsFunctionRef;

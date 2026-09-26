@@ -42,7 +42,10 @@ abstract class QjsTag {
 abstract class QjsEvalFlags {
   static const global = 0;
   static const module = 1;
+  static const strict = 1 << 3;
   static const compileOnly = 1 << 5;
+  static const backtraceBarrier = 1 << 6;
+  static const async = 1 << 7;
 }
 
 /// quickjs_bridge.c 的 FFI 绑定（本仓 so 的 Dart 侧）。
@@ -308,6 +311,61 @@ class QjsBridge {
     newUint8Array = _lk<NativeFunction<Int32 Function(Pointer<Void>,
             Pointer<Uint8>, Int32, Pointer<QjsValue>)>>('qjs_bridge_new_uint8_array')
         .asFunction();
+
+    // ---- fjs 封装对齐新增（2026-09-27）：中断/超时、结构化异常、
+    // Promise settle、Date/BigInt、未处理 rejection 管道、GC 阈值 ----
+    installRuntimeCtl = _lk<NativeFunction<Int32 Function(Pointer<Void>)>>(
+            'qjs_install_runtime_ctl')
+        .asFunction();
+    requestInterrupt = _lk<NativeFunction<Void Function(Pointer<Void>)>>(
+            'qjs_request_interrupt')
+        .asFunction();
+    clearInterrupt = _lk<NativeFunction<Void Function(Pointer<Void>)>>(
+            'qjs_clear_interrupt')
+        .asFunction();
+    setDeadline = _lk<NativeFunction<Void Function(Pointer<Void>, Int64)>>(
+            'qjs_set_deadline')
+        .asFunction();
+    pollRejection = _lk<
+            NativeFunction<
+                Int32 Function(Pointer<Void>, Pointer<Pointer<Utf8>>,
+                    Pointer<Uint64>)>>('qjs_poll_rejection')
+        .asFunction();
+    setGcThreshold = _lk<
+            NativeFunction<Void Function(Pointer<Void>, UintPtr)>>(
+            'qjs_set_gc_threshold')
+        .asFunction();
+    getExceptionDetails = _lk<
+            NativeFunction<
+                Int32 Function(
+                    Pointer<Void>,
+                    Pointer<Pointer<Utf8>>,
+                    Pointer<Pointer<Utf8>>,
+                    Pointer<Pointer<Utf8>>)>>('qjs_get_exception_details')
+        .asFunction();
+    promiseState = _lk<NativeFunction<Int32 Function(Pointer<Void>,
+            Pointer<QjsValue>)>>('qjs_promise_state')
+        .asFunction();
+    promiseResult = _lk<
+            NativeFunction<
+                Int32 Function(Pointer<Void>, Pointer<QjsValue>,
+                    Pointer<QjsValue>)>>('qjs_promise_result')
+        .asFunction();
+    newDate = _lk<
+            NativeFunction<
+                Int32 Function(Pointer<Void>, Double,
+                    Pointer<QjsValue>)>>('qjs_new_date')
+        .asFunction();
+    getDateMs = _lk<
+            NativeFunction<
+                Int32 Function(Pointer<Void>, Pointer<QjsValue>,
+                    Pointer<Double>)>>('qjs_get_date_ms')
+        .asFunction();
+    newBigInt = _lk<
+            NativeFunction<
+                Int32 Function(Pointer<Void>, Pointer<Utf8>, Int32,
+                    Pointer<QjsValue>)>>('qjs_new_bigint')
+        .asFunction();
   }
 
   /// 释放 Dart 侧的 JSValue 槽内存。
@@ -392,6 +450,25 @@ class QjsBridge {
       Pointer<Pointer<Uint8>>, Pointer<Int32>) getBytes;
   late final int Function(
       Pointer<Void>, Pointer<Uint8>, int, Pointer<QjsValue>) newUint8Array;
+
+  // ---- fjs 封装对齐新增（2026-09-27）----
+  late final int Function(Pointer<Void>) installRuntimeCtl;
+  late final void Function(Pointer<Void>) requestInterrupt;
+  late final void Function(Pointer<Void>) clearInterrupt;
+  late final void Function(Pointer<Void>, int) setDeadline;
+  late final int Function(
+      Pointer<Void>, Pointer<Pointer<Utf8>>, Pointer<Uint64>) pollRejection;
+  late final void Function(Pointer<Void>, int) setGcThreshold;
+  late final int Function(Pointer<Void>, Pointer<Pointer<Utf8>>,
+      Pointer<Pointer<Utf8>>, Pointer<Pointer<Utf8>>) getExceptionDetails;
+  late final int Function(Pointer<Void>, Pointer<QjsValue>) promiseState;
+  late final int Function(
+      Pointer<Void>, Pointer<QjsValue>, Pointer<QjsValue>) promiseResult;
+  late final int Function(Pointer<Void>, double, Pointer<QjsValue>) newDate;
+  late final int Function(Pointer<Void>, Pointer<QjsValue>, Pointer<Double>)
+      getDateMs;
+  late final int Function(
+      Pointer<Void>, Pointer<Utf8>, int, Pointer<QjsValue>) newBigInt;
 
   static QjsBridge? _instance;
 

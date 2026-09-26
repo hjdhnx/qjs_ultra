@@ -18,8 +18,13 @@ typedef JsHostFunction = Object? Function(List<Object?> args);
 ///   （例如 `Map` 里的 `complete` 回调）。句柄**只能**回传给
 ///   [JsEngine.callFunction]，在 Dart 侧直接调用它是未定义行为。
 ///   `getGlobalProperty` 返回的对象里的函数同理。
+/// - **Date**：JS `Date` ↔ Dart `DateTime`（毫秒精度快照）。
+/// - **BigInt**：JS `BigInt` → Dart 十进制数字符串（任意精度）；
+///   Dart `int` 超出 ±2^53（JSON 安全整数）→ JS `BigInt`，保精度不降 double。
 /// - 未在列表内的 JS 值（Symbol、Proxy 等）应转换为 String 或抛错，
 ///   不得静默丢弃。
+/// - JS 侧 resolve 的 Promise 会被自动等待（排空微任务至 settle），
+///   Dart 侧拿到的是 settle 后的值；被 reject 时抛 `JsEvalException`。
 
 /// 模块加载器，对应原版 `QuickJSContext.BytecodeModuleLoader`。
 ///
@@ -44,6 +49,7 @@ class JsEngineConfig {
   const JsEngineConfig({
     this.stackSize = 1024 * 1024,
     this.memoryLimit = 64 * 1024 * 1024,
+    this.gcThreshold,
     this.timeoutMs,
   });
 
@@ -53,7 +59,16 @@ class JsEngineConfig {
   /// 堆上限，字节；0 表示不限制。
   final int memoryLimit;
 
-  /// 墙钟超时，毫秒；null 表示不限制。
+  /// GC 触发阈值（已分配字节数），null 表示用引擎默认。
+  final int? gcThreshold;
+
+  /// 单次求值/调用的墙钟超时，毫秒；null 表示不限制。
+  ///
+  /// 由引擎中断处理器实现（对齐 fjs 的 shutdown 模型）：到期后 JS 执行在
+  /// 下一个中断检查点被打断，抛出 `errorKind == timeout` 的
+  /// [JsEvalException]。同步调用模型下 Dart 侧 Timer 不会触发
+  /// （eval 阻塞 isolate），超时必须由 C 侧查墙钟——`while(true){}`
+  /// 这类死循环也能被回收成可捕获异常，而非卡死线程。
   final int? timeoutMs;
 }
 

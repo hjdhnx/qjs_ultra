@@ -188,15 +188,195 @@ void main() {
           reason: '模块体副作用应生效');
     });
 
-    test('模块内可调用宿主函数（爬虫源核心路径）', () {
-      engine.registerFunction('hostEcho', (args) => {'echo': args.first});
-      engine.evaluateModule(
-        'globalThis.got = hostEcho("hi");',
-        fileName: 'host_call.js',
-      );
-      expect(engine.getGlobalProperty('got'), {'echo': 'hi'});
-    });
+  test('模块内可调用宿主函数（爬虫源核心路径）', () {
+    engine.registerFunction('hostEcho', (args) => {'echo': args.first});
+    engine.evaluateModule(
+      'globalThis.got = hostEcho("hi");',
+      fileName: 'host_call.js',
+    );
+    expect(engine.getGlobalProperty('got'), {'echo': 'hi'});
   });
+});
+
+group('结构化错误（fjs JsError 对齐）', () {
+  late QuickjsEngine engine;
+  setUp(() {
+    engine = QuickjsEngine.createWith(const JsEngineConfig(), libPath: libPath);
+  });
+  tearDown(() => engine.dispose());
+
+  test('TypeError 按名归类', () {
+    try {
+      engine.evaluate('null.foo');
+      fail('应抛 JsEvalException');
+    } on JsEvalException catch (e) {
+      expect(e.name, 'TypeError');
+      expect(e.errorKind, JsErrorKind.type);
+      expect(e.message, contains('TypeError'));
+    }
+  });
+
+  test('语法错误带行号列号', () {
+    try {
+      engine.evaluate('function {', fileName: 'broken.js');
+      fail('应抛 JsEvalException');
+    } on JsEvalException catch (e) {
+      expect(e.errorKind, JsErrorKind.syntax);
+      expect(e.line, isNotNull, reason: 'stack: ${e.stack}');
+      expect(e.column, isNotNull);
+    }
+  });
+
+  test('栈溢出归类 stackOverflow 且引擎可复用', () {
+    try {
+      engine.evaluate('(function f(){ f() })()');
+      fail('应抛 JsEvalException');
+    } on JsEvalException catch (e) {
+      expect(e.errorKind, JsErrorKind.stackOverflow);
+    }
+    expect(engine.evaluate('1 + 1'), 2, reason: '溢出后上下文应仍可用');
+  });
+});
+
+group('墙钟超时（interrupt handler）', () {
+  test('死循环被超时打断，错误归类 timeout，引擎可复用', () {
+    final engine = QuickjsEngine.createWith(
+      const JsEngineConfig(timeoutMs: 100),
+      libPath: libPath,
+    );
+    try {
+      final sw = Stopwatch()..start();
+      try {
+        engine.evaluate('while (true) {}');
+        fail('应抛超时异常');
+      } on JsEvalException catch (e) {
+        expect(e.errorKind, JsErrorKind.timeout, reason: 'message: ${e.message}');
+      }
+      sw.stop();
+      expect(sw.elapsedMilliseconds, lessThan(10000), reason: '应远早于无限等待');
+      // 打断后 deadline 已清除，引擎必须可复用
+      expect(engine.evaluate('40 + 2'), 42);
+    } finally {
+      engine.dispose();
+    }
+  });
+
+  test('未配置超时的引擎不受影响', () {
+    expect(engine.evaluate('7 * 6'), 42);
+  });
+});
+
+group('值转换护栏（fjs ConversionState 对齐）', () {
+  test('自引用对象不炸宿主，非循环字段保留', () {
+    final out = engine.evaluate('var a = {ok: 1}; a.self = a; a') as Map;
+    expect(out['ok'], 1);
+    expect(out['self'], isNull, reason: '循环引用处降级 null');
+  });
+
+  test('深层嵌套对象不栈溢出', () {
+    engine.evaluate(
+      'var deep = 0; for (var i = 0; i < 200; i++) deep = {v: deep};',
+    );
+    // 128 层护栏截断后是 null，无论如何不应崩
+    expect(() => engine.getGlobalProperty('deep'), returnsNormally);
+  });
+});
+
+group('Date / BigInt 编组（fjs value 对齐）', () {
+  test('JS Date → Dart DateTime', () {
+    final d = engine.evaluate('new Date(1700000000000)');
+    expect(d, isA<DateTime>());
+    expect((d as DateTime).millisecondsSinceEpoch, 1700000000000);
+  });
+
+  test('Invalid Date 不炸', () {
+    final d = engine.evaluate('new Date(NaN)');
+    expect(d, isA<Map>(), reason: 'NaN 时间值降级为对象路径');
+  });
+
+  test('Dart DateTime → JS Date', () {
+    engine.setGlobalProperty('day', DateTime.fromMillisecondsSinceEpoch(86400000));
+    expect(engine.evaluate('Number(day)'), 86400000);
+  });
+
+  test('JS BigInt → Dart 十进制字符串（任意精度）', () {
+    expect(
+      engine.evaluate('123456789012345678901234567890n'),
+      '123456789012345678901234567890',
+    );
+  });
+
+  test('Dart 超安全整数 → JS BigInt（保精度不降 double）', () {
+    engine.setGlobalProperty('big', 9223372036854775807);
+    expect(engine.evaluate('typeof big'), 'bigint');
+    expect(engine.evaluate('big.toString()'), '9223372036854775807');
+  });
+});
+
+group('Promise settle（fjs async eval 同步泵版）', () {
+  test('async IIFE 的 promise 被等待并取 settle 值', () {
+    final v = engine.evaluate(
+      '(async () => { await Promise.resolve(); return 7; })()',
+    );
+    expect(v, 7);
+  });
+
+  test('Promise 链与 all 组合', () {
+    final v = engine.evaluate(
+      'Promise.all([Promise.resolve(1), Promise.resolve(2)])'
+      '.then(xs => xs[0] + xs[1])',
+    );
+    expect(v, 3);
+  });
+
+  test('顶层 await 模块执行完整', () {
+    engine.evaluateModule(
+      'const x = await Promise.resolve(41); globalThis.topAwait = x + 1;',
+      fileName: 'top_await.mjs',
+    );
+    expect(engine.getGlobalProperty('topAwait'), 42);
+  });
+
+  test('rejected promise 抛结构化异常', () {
+    try {
+      engine.evaluate('Promise.reject(new TypeError("nope"))');
+      fail('应抛 JsEvalException');
+    } on JsEvalException catch (e) {
+      expect(e.errorKind, JsErrorKind.type);
+      expect(e.message, contains('nope'));
+    }
+  });
+});
+
+group('未处理 rejection 管道（fjs error sink 对齐）', () {
+  test(' rejection 被收集且可排空', () {
+    // 构造不被 settle 等待的 rejection：放进 pending promise，绕过
+    // _resolveResult 的等待路径（其 reject 会被直接抛出）
+    engine.evaluate(
+      '(async () => { Promise.reject(new Error("bg-boom"));'
+      ' await null; })()',
+    );
+    final drained = engine.drainUnhandledRejections();
+    expect(drained.errors.join(' '), contains('bg-boom'));
+    // 排空后再取应为空
+    expect(engine.drainUnhandledRejections().errors, isEmpty);
+  });
+});
+
+group('GC 阈值', () {
+  test('配置 gcThreshold 不崩且引擎可用', () {
+    final e2 = QuickjsEngine.createWith(
+      const JsEngineConfig(gcThreshold: 1 << 20),
+      libPath: libPath,
+    );
+    try {
+      expect(e2.evaluate('1 + 1'), 2);
+      e2.runGC();
+    } finally {
+      e2.dispose();
+    }
+  });
+});
 }
 
 /// 库文件里是否**缺少**指定导出符号名。

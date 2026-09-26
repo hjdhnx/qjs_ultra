@@ -8,10 +8,12 @@
 # 多一个 = 需评估是否同步 Dart 绑定。改此文件 = 改 ABI，必须同步升本体版本。
 # 详见 README「ABI 契约」与 DsPlayer docs/plugin/QJS-PLUGIN-DESIGN.md。
 #
+
 qjs_array_length
 qjs_bridge_new_uint8_array
 qjs_call
 qjs_clear_callbacks
+qjs_clear_interrupt
 qjs_compile
 qjs_dup_value
 qjs_eval
@@ -23,7 +25,9 @@ qjs_free_runtime
 qjs_free_string_array
 qjs_free_value
 qjs_get_bytes
+qjs_get_date_ms
 qjs_get_exception
+qjs_get_exception_details
 qjs_get_float64
 qjs_get_global
 qjs_get_int32
@@ -31,6 +35,7 @@ qjs_get_prop
 qjs_get_prop_u32
 qjs_get_tag
 qjs_install_module_loader
+qjs_install_runtime_ctl
 qjs_is_array
 qjs_is_exception
 qjs_is_function
@@ -41,16 +46,24 @@ qjs_make_null
 qjs_make_undefined
 qjs_memory_usage
 qjs_new_array
+qjs_new_bigint
 qjs_new_context
+qjs_new_date
 qjs_new_host_function
 qjs_new_object
 qjs_new_runtime
 qjs_new_string
 qjs_own_property_names
 qjs_parse_json
+qjs_poll_rejection
+qjs_promise_result
+qjs_promise_state
 qjs_register_function
+qjs_request_interrupt
 qjs_run_gc
 qjs_set_callbacks
+qjs_set_deadline
+qjs_set_gc_threshold
 qjs_set_max_stack_size
 qjs_set_memory_limit
 qjs_set_prop

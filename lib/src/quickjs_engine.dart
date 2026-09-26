@@ -42,14 +42,20 @@ class JsFunctionRef {
 /// 所有 JSValue 走堆指针，Dart 回调全部 void 签名，
 /// 宿主函数异常转成 JS Error（JS 侧可 try/catch）。
 class QuickjsEngine implements JsEngine {
-  QuickjsEngine._(this._bridge, JsEngineConfig config) {
+  QuickjsEngine._(this._bridge, this._config) {
     _rt = _bridge.newRuntime();
     if (_rt == nullptr) throw StateError('JS_NewRuntime 失败');
-    if (config.memoryLimit > 0) {
-      _bridge.setMemoryLimit(_rt, config.memoryLimit);
+    // 中断/超时处理器 + 未处理 rejection 管道（ctl 由 C 层 qjs_free_runtime
+    // 自动回收，无需 Dart 侧清理）
+    _bridge.installRuntimeCtl(_rt);
+    if (_config.memoryLimit > 0) {
+      _bridge.setMemoryLimit(_rt, _config.memoryLimit);
     }
-    if (config.stackSize > 0) {
-      _bridge.setMaxStackSize(_rt, config.stackSize);
+    if (_config.gcThreshold != null && _config.gcThreshold! > 0) {
+      _bridge.setGcThreshold(_rt, _config.gcThreshold!);
+    }
+    if (_config.stackSize > 0) {
+      _bridge.setMaxStackSize(_rt, _config.stackSize);
     }
 
     _hostCallCb = NativeCallable<
@@ -78,8 +84,13 @@ class QuickjsEngine implements JsEngine {
   }
 
   final QjsBridge _bridge;
+  final JsEngineConfig _config;
   late final Pointer<Void> _rt;
   late final Pointer<Void> _ctxPointer;
+
+  /// 当前是否处于墙钟截止期内（_runGuarded 设置）。用于把引擎的
+  /// "interrupted" 异常归类为 timeout。
+  bool _deadlineActive = false;
 
   NativeCallable<
           Void Function(Int32, Pointer<Void>, Int32, Pointer<QjsValue>,
@@ -134,32 +145,77 @@ class QuickjsEngine implements JsEngine {
   /// 计算 UTF-8 编码后的字节长度（C 桥按字节读取字符串）。
   static int _utf8Len(String s) => utf8.encode(s).length;
 
-  Object? _eval(String script, String fileName, int flags) {
-    final scriptPtr = script.toNativeUtf8();
-    final namePtr = fileName.toNativeUtf8();
-    final out = _newSlot();
+  Object? _eval(String script, String fileName, int flags) => _runGuarded(() {
+        final scriptPtr = script.toNativeUtf8();
+        final namePtr = fileName.toNativeUtf8();
+        final out = _newSlot();
+        try {
+          final rc = _bridge.eval(
+            _ctxPointer,
+            scriptPtr,
+            _utf8Len(script),
+            namePtr,
+            flags,
+            out,
+          );
+          if (rc != 0) throw _takeException();
+          final result = _resolveResult(out);
+          _drainJobs();
+          return result;
+        } finally {
+          // rejected promise 会从 _resolveResult 抛出——free 必须在 finally，
+          // 否则 promise 对象引用泄漏
+          _bridge.freeValue(_ctxPointer, out);
+          _bridge.freeSlot(out);
+          malloc
+            ..free(scriptPtr)
+            ..free(namePtr);
+        }
+      });
+
+  /// 单次 JS 执行的墙钟截止期（fjs shutdown 模型的同步宿主适配版）：
+  /// Dart 侧 Timer 在同步 eval 期间不会触发，超时必须由 C 侧中断处理器
+  /// 查墙钟。离开作用域即清除，一次调用超时不影响后续调用。
+  T _runGuarded<T>(T Function() body) {
+    final timeout = _config.timeoutMs;
+    final useDeadline = timeout != null && timeout > 0;
+    if (useDeadline) {
+      _deadlineActive = true;
+      _bridge.setDeadline(
+          _rt, DateTime.now().millisecondsSinceEpoch + timeout);
+    }
     try {
-      final rc = _bridge.eval(
-        _ctxPointer,
-        scriptPtr,
-        _utf8Len(script),
-        namePtr,
-        flags,
-        out,
-      );
-      if (rc != 0) {
-        final message = _takeExceptionMessage();
-        throw JsEvalException(message);
-      }
-      final result = _jsToDart(out);
-      _bridge.freeValue(_ctxPointer, out);
-      _bridge.freeSlot(out);
-      _drainJobs();
-      return result;
+      return body();
     } finally {
-      malloc
-        ..free(scriptPtr)
-        ..free(namePtr);
+      if (useDeadline) {
+        _deadlineActive = false;
+        _bridge.setDeadline(_rt, 0);
+      }
+    }
+  }
+
+  /// 求值结果统一出口（fjs async eval 语义的同步泵版）：
+  /// 结果是 promise 时泵微任务直至 settle 并取 settle 值；rejected 抛
+  /// [JsEvalException]；队空仍 pending（在等宿主异步，本契约不支持）时
+  /// 返回 null——promise 无 JSON-like Dart 表示。
+  Object? _resolveResult(Pointer<QjsValue> slot) {
+    var state = _bridge.promiseState(_ctxPointer, slot);
+    if (state < 0) return _jsToDart(slot, _Conv());
+    while (state == 0) {
+      final rc = _bridge.executePendingJob(_rt);
+      if (rc < 0) throw _takeException();
+      if (rc == 0) break;
+      state = _bridge.promiseState(_ctxPointer, slot);
+    }
+    if (state == 0) return null;
+    final result = _newSlot();
+    try {
+      _bridge.promiseResult(_ctxPointer, slot, result);
+      if (state == 2) throw _exceptionFromValue(result);
+      return _jsToDart(result, _Conv());
+    } finally {
+      _bridge.freeValue(_ctxPointer, result);
+      _bridge.freeSlot(result);
     }
   }
 
@@ -169,55 +225,58 @@ class QuickjsEngine implements JsEngine {
     return _compile(source, fileName ?? 'module.js', true);
   }
 
-  Uint8List _compile(String source, String fileName, bool isModule) {
-    final srcPtr = source.toNativeUtf8();
-    final namePtr = fileName.toNativeUtf8();
-    final bufPtr = malloc<Pointer<Uint8>>();
-    final lenPtr = malloc<Int32>();
-    try {
-      final rc = _bridge.compile(
-        _ctxPointer,
-        srcPtr,
-        _utf8Len(source),
-        namePtr,
-        isModule ? 1 : 0,
-        bufPtr,
-        lenPtr,
-      );
-      if (rc != 0) {
-        throw JsEvalException(_takeExceptionMessage());
-      }
-      final bytes = copyNativeBuffer(bufPtr.value, lenPtr.value);
-      _bridge.freeBuffer(bufPtr.value.cast());
-      return bytes;
-    } finally {
-      malloc
-        ..free(srcPtr)
-        ..free(namePtr)
-        ..free(bufPtr)
-        ..free(lenPtr);
-    }
-  }
+  Uint8List _compile(String source, String fileName, bool isModule) =>
+      _runGuarded(() {
+        final srcPtr = source.toNativeUtf8();
+        final namePtr = fileName.toNativeUtf8();
+        final bufPtr = malloc<Pointer<Uint8>>();
+        final lenPtr = malloc<Int32>();
+        try {
+          final rc = _bridge.compile(
+            _ctxPointer,
+            srcPtr,
+            _utf8Len(source),
+            namePtr,
+            isModule ? 1 : 0,
+            bufPtr,
+            lenPtr,
+          );
+          if (rc != 0) {
+            throw _takeException();
+          }
+          final bytes = copyNativeBuffer(bufPtr.value, lenPtr.value);
+          _bridge.freeBuffer(bufPtr.value.cast());
+          return bytes;
+        } finally {
+          malloc
+            ..free(srcPtr)
+            ..free(namePtr)
+            ..free(bufPtr)
+            ..free(lenPtr);
+        }
+      });
 
   @override
   Object? executeBytecode(Uint8List bytecode, {String? fileName}) {
     _checkDisposed();
-    final buf = malloc<Uint8>(bytecode.length);
-    buf.asTypedList(bytecode.length).setAll(0, bytecode);
-    final out = _newSlot();
-    try {
-      final rc = _bridge.evalBytecode(_ctxPointer, buf, bytecode.length, out);
-      if (rc != 0) {
-        throw JsEvalException(_takeExceptionMessage());
+    return _runGuarded(() {
+      final buf = malloc<Uint8>(bytecode.length);
+      buf.asTypedList(bytecode.length).setAll(0, bytecode);
+      final out = _newSlot();
+      try {
+        final rc = _bridge.evalBytecode(_ctxPointer, buf, bytecode.length, out);
+        if (rc != 0) {
+          throw _takeException();
+        }
+        final result = _resolveResult(out);
+        _drainJobs();
+        return result;
+      } finally {
+        _bridge.freeValue(_ctxPointer, out);
+        _bridge.freeSlot(out);
+        malloc.free(buf);
       }
-      final result = _jsToDart(out);
-      _bridge.freeValue(_ctxPointer, out);
-      _bridge.freeSlot(out);
-      _drainJobs();
-      return result;
-    } finally {
-      malloc.free(buf);
-    }
+    });
   }
 
   @override
@@ -319,7 +378,7 @@ class QuickjsEngine implements JsEngine {
       } finally {
         malloc.free(namePtr);
       }
-      final result = _jsToDart(value);
+      final result = _jsToDart(value, _Conv());
       _bridge.freeValue(_ctxPointer, value);
       _bridge.freeValue(_ctxPointer, global);
       return result;
@@ -372,39 +431,40 @@ class QuickjsEngine implements JsEngine {
     }
   }
 
-  Object? _callSlot(Pointer<QjsValue> funcSlot, List<Object?> args) {
-    final argv = calloc<QjsValue>(args.isEmpty ? 1 : args.length);
-    try {
-      for (var i = 0; i < args.length; i++) {
-        _dartToJs(args[i], argv + i);
-      }
-      final out = _newSlot();
-      try {
-        final rc = _bridge.call(
-          _ctxPointer,
-          funcSlot,
-          nullptr,
-          args.length,
-          argv,
-          out,
-        );
-        if (rc != 0) {
-          throw JsEvalException(_takeExceptionMessage());
+  Object? _callSlot(Pointer<QjsValue> funcSlot, List<Object?> args) =>
+      _runGuarded(() {
+        final argv = calloc<QjsValue>(args.isEmpty ? 1 : args.length);
+        try {
+          for (var i = 0; i < args.length; i++) {
+            _dartToJs(args[i], argv + i);
+          }
+          final out = _newSlot();
+          try {
+            final rc = _bridge.call(
+              _ctxPointer,
+              funcSlot,
+              nullptr,
+              args.length,
+              argv,
+              out,
+            );
+            if (rc != 0) {
+              throw _takeException();
+            }
+            final result = _resolveResult(out);
+            _drainJobs();
+            return result;
+          } finally {
+            _bridge.freeValue(_ctxPointer, out);
+            _bridge.freeSlot(out);
+          }
+        } finally {
+          for (var i = 0; i < args.length; i++) {
+            _bridge.freeValue(_ctxPointer, argv + i);
+          }
+          malloc.free(argv);
         }
-        final result = _jsToDart(out);
-        _bridge.freeValue(_ctxPointer, out);
-        _drainJobs();
-        return result;
-      } finally {
-        _bridge.freeSlot(out);
-      }
-    } finally {
-      for (var i = 0; i < args.length; i++) {
-        _bridge.freeValue(_ctxPointer, argv + i);
-      }
-      malloc.free(argv);
-    }
-  }
+      });
 
   @override
   Object? parseJson(String json) {
@@ -414,9 +474,9 @@ class QuickjsEngine implements JsEngine {
     try {
       final rc = _bridge.parseJson(_ctxPointer, ptr, _utf8Len(json), out);
       if (rc != 0) {
-        throw JsEvalException(_takeExceptionMessage());
+        throw _takeException();
       }
-      final result = _jsToDart(out);
+      final result = _jsToDart(out, _Conv());
       _bridge.freeValue(_ctxPointer, out);
       return result;
     } finally {
@@ -428,38 +488,43 @@ class QuickjsEngine implements JsEngine {
   @override
   String stringify(Object? value) {
     _checkDisposed();
-    final slot = _newSlot();
-    try {
-      _dartToJs(value, slot);
-      final outPtr = malloc<Pointer<Utf8>>();
-      final lenPtr = malloc<Int32>();
+    return _runGuarded(() {
+      final slot = _newSlot();
       try {
-        final rc = _bridge.stringify(_ctxPointer, slot, outPtr, lenPtr);
-        if (rc != 0) {
-          throw JsEvalException(_takeExceptionMessage());
+        _dartToJs(value, slot);
+        final outPtr = malloc<Pointer<Utf8>>();
+        final lenPtr = malloc<Int32>();
+        try {
+          final rc = _bridge.stringify(_ctxPointer, slot, outPtr, lenPtr);
+          if (rc != 0) {
+            throw _takeException();
+          }
+          final s = outPtr.value.toDartString();
+          _bridge.freeBuffer(outPtr.value.cast());
+          return s;
+        } finally {
+          malloc
+            ..free(outPtr)
+            ..free(lenPtr);
+          _bridge.freeValue(_ctxPointer, slot);
         }
-        final s = outPtr.value.toDartString();
-        _bridge.freeBuffer(outPtr.value.cast());
-        return s;
       } finally {
-        malloc
-          ..free(outPtr)
-          ..free(lenPtr);
-        _bridge.freeValue(_ctxPointer, slot);
+        _bridge.freeSlot(slot);
       }
-    } finally {
-      _bridge.freeSlot(slot);
-    }
+    });
   }
 
   @override
   bool executePendingJobs() {
     _checkDisposed();
-    for (;;) {
-      final rc = _bridge.executePendingJob(_rt);
-      if (rc == 0) return true; // 队列已空
-      if (rc < 0) return true; // job 内异常：清空待处理状态后视为结束
-    }
+    return _runGuarded(() {
+      for (;;) {
+        final rc = _bridge.executePendingJob(_rt);
+        if (rc == 0) return true; // 队列已空
+        if (rc < 0) throw _takeException(); // job 内异常必须浮出，吞掉会让
+        // 失败表现为「静默不执行」（对齐 _drainJobs 的契约）
+      }
+    });
   }
 
   /// 排空微任务队列。job 内抛出的 JS 异常不能吞掉，
@@ -468,7 +533,33 @@ class QuickjsEngine implements JsEngine {
     for (;;) {
       final rc = _bridge.executePendingJob(_rt);
       if (rc == 0) return;
-      if (rc < 0) throw JsEvalException(_takeExceptionMessage());
+      if (rc < 0) throw _takeException();
+    }
+  }
+
+  /// 排空后台未处理 promise rejection 队列（fjs drainUnhandledJobErrors
+  /// 语义，C 侧 rejection tracker 收集）。这是 QuickjsEngine 的具体能力，
+  /// 不在 [JsEngine] 抽象里。返回格式化文本与队满（32 条）累计丢弃数。
+  ///
+  /// 队列语义是「**曾**处于未处理状态」的 rejection：被 Dart 侧
+  /// `_resolveResult` 转成异常抛出的 rejected promise，入队记录同样保留
+  /// （本层同步模型不做 fjs 的身份撤单/checkpoint 差集——无重放问题，
+  /// 诊断场景下宁多勿丢）。
+  ({List<String> errors, int dropped}) drainUnhandledRejections() {
+    _checkDisposed();
+    final errors = <String>[];
+    final out = malloc<Pointer<Utf8>>();
+    final dropped = malloc<Uint64>();
+    try {
+      while (_bridge.pollRejection(_rt, out, dropped) == 1) {
+        final text = _optNativeText(out.value);
+        if (text != null) errors.add(text);
+      }
+      return (errors: errors, dropped: dropped.value);
+    } finally {
+      malloc
+        ..free(out)
+        ..free(dropped);
     }
   }
 
@@ -549,8 +640,9 @@ class QuickjsEngine implements JsEngine {
   ) {
     final fn = _hostFunctions[id];
     if (fn == null) return;
+    final cx = _Conv();
     final args = <Object?>[
-      for (var i = 0; i < argc; i++) _jsToDart(argv + i),
+      for (var i = 0; i < argc; i++) _jsToDart(argv + i, cx),
     ];
     try {
       final result = fn(args);
@@ -646,7 +738,7 @@ class QuickjsEngine implements JsEngine {
 
   Pointer<QjsValue> _newSlot() => malloc<QjsValue>();
 
-  Object? _jsToDart(Pointer<QjsValue> slot) {
+  Object? _jsToDart(Pointer<QjsValue> slot, _Conv cx) {
     switch (_bridge.getTag(slot)) {
       case QjsTag.int_:
         // 与 C 侧 `JS_VALUE_GET_INT(v) = (int)(v).u.uint64` 对齐：u64 是无符号
@@ -664,15 +756,16 @@ class QuickjsEngine implements JsEngine {
         return _readCString(slot);
       case QjsTag.symbol:
       case QjsTag.bigInt:
-        // core 契约：Symbol 等未列值转 String，不得静默丢弃。
-        // JS_ToCStringLen 对 symbol 产出 description、bigInt 产出十进制文本。
+        // core 契约：Symbol 转 String；BigInt 保任意精度（十进制文本），
+        // 不得静默丢弃或降 double。JS_ToCStringLen 对 symbol 产出
+        // description、bigInt 产出十进制文本。
         final s = _readCString(slot);
         return s ?? slot.ref.u.u64.toString();
       case QjsTag.null_:
       case QjsTag.undefined:
         return null;
       case QjsTag.object:
-        return _objectToDart(slot);
+        return _objectToDart(slot, cx);
       default:
         return null;
     }
@@ -694,75 +787,99 @@ class QuickjsEngine implements JsEngine {
     }
   }
 
-  Object? _objectToDart(Pointer<QjsValue> slot) {
-    // TypedArray / ArrayBuffer？直接回读为 Uint8List。
-    // 必须放在数组判定之前（TypedArray 也是 object tag）。
-    final bytes = _tryReadBytes(slot);
-    if (bytes != null) return bytes;
+  Object? _objectToDart(Pointer<QjsValue> slot, _Conv cx) {
+    // 护栏（fjs 同款上限）：超限/循环处降级 null——宁可丢值不可打爆宿主栈
+    if (++cx.nodes > _Conv.maxNodes || ++cx.depth > _Conv.maxDepth) {
+      return null;
+    }
+    // JSObject* 在一次转换遍历中稳定，可作循环身份（仅 64 位，见文件头约定）
+    final identity = slot.ref.u.u64;
+    if (!cx.active.add(identity)) return null;
+    try {
+      // TypedArray / ArrayBuffer？直接回读为 Uint8List。
+      // 必须放在数组判定之前（TypedArray 也是 object tag）。
+      final bytes = _tryReadBytes(slot);
+      if (bytes != null) return bytes;
 
-    // 数组？用引擎内置 JS_IsArray 精确判定（替代 length 属性猜测：
-    // 旧方案对 {length: 3} 这类普通对象会误判成数组）。
-    if (_bridge.isArray(_ctxPointer, slot) != 0) {
-      final lenSlot = _newSlot();
+      // Date？借道 getTime()（fjs 同款，不碰引擎内部表示）。
+      // Invalid Date（NaN）不算命中，继续走对象路径。
+      final ms = malloc<Double>();
       try {
-        final namePtr = 'length'.toNativeUtf8();
-        try {
-          _bridge.getProp(_ctxPointer, slot, namePtr, lenSlot);
-        } finally {
-          malloc.free(namePtr);
+        if (_bridge.getDateMs(_ctxPointer, slot, ms) == 0 &&
+            !ms.value.isNaN) {
+          return DateTime.fromMillisecondsSinceEpoch(ms.value.round());
         }
-        final n = lenSlot.ref.u.u64;
-        final list = <Object?>[];
-        for (var i = 0; i < n; i++) {
-          final item = _newSlot();
+      } finally {
+        malloc.free(ms);
+      }
+
+      // 数组？用引擎内置 JS_IsArray 精确判定（替代 length 属性猜测：
+      // 旧方案对 {length: 3} 这类普通对象会误判成数组）。
+      if (_bridge.isArray(_ctxPointer, slot) != 0) {
+        final lenSlot = _newSlot();
+        try {
+          final namePtr = 'length'.toNativeUtf8();
           try {
-            _bridge.getPropU32(_ctxPointer, slot, i, item);
-            list.add(_jsToDart(item));
+            _bridge.getProp(_ctxPointer, slot, namePtr, lenSlot);
           } finally {
-            _bridge.freeValue(_ctxPointer, item);
-            _bridge.freeSlot(item);
+            malloc.free(namePtr);
           }
-        }
-        return list;
-      } finally {
-        _bridge.freeValue(_ctxPointer, lenSlot);
-        _bridge.freeSlot(lenSlot);
-      }
-    }
-
-    // 函数？
-    if (_bridge.isFunction(_ctxPointer, slot) != 0) {
-      final refSlot = _newSlot();
-      _bridge.dupValue(_ctxPointer, slot);
-      _bridge.valueMove(refSlot, slot);
-      final ref = JsFunctionRef._(this, refSlot);
-      _openFunctionRefs.add(ref);
-      return ref;
-    }
-
-    // 普通对象 → Map。
-    // 属性名枚举用 bridge 的 qjs_own_property_names（JS_GetOwnPropertyNames，
-    // 仅枚举可枚举 string key），替代早期「临时挂全局 + evaluate」的 hack。
-    final names = _ownPropertyNames(slot);
-    if (names == null) return null;
-
-    final map = <String, Object?>{};
-    for (final name in names) {
-      final value = _newSlot();
-      try {
-        final namePtr = name.toNativeUtf8();
-        try {
-          _bridge.getProp(_ctxPointer, slot, namePtr, value);
+          final n = lenSlot.ref.u.u64;
+          final list = <Object?>[];
+          for (var i = 0; i < n; i++) {
+            final item = _newSlot();
+            try {
+              _bridge.getPropU32(_ctxPointer, slot, i, item);
+              list.add(_jsToDart(item, cx));
+            } finally {
+              _bridge.freeValue(_ctxPointer, item);
+              _bridge.freeSlot(item);
+            }
+          }
+          return list;
         } finally {
-          malloc.free(namePtr);
+          _bridge.freeValue(_ctxPointer, lenSlot);
+          _bridge.freeSlot(lenSlot);
         }
-        map[name] = _jsToDart(value);
-      } finally {
-        _bridge.freeValue(_ctxPointer, value);
-        _bridge.freeSlot(value);
       }
+
+      // 函数？
+      if (_bridge.isFunction(_ctxPointer, slot) != 0) {
+        final refSlot = _newSlot();
+        _bridge.dupValue(_ctxPointer, slot);
+        _bridge.valueMove(refSlot, slot);
+        final ref = JsFunctionRef._(this, refSlot);
+        _openFunctionRefs.add(ref);
+        return ref;
+      }
+
+      // 普通对象 → Map。
+      // 属性名枚举用 bridge 的 qjs_own_property_names（JS_GetOwnPropertyNames，
+      // 仅枚举可枚举 string key），替代早期「临时挂全局 + evaluate」的 hack。
+      final names = _ownPropertyNames(slot);
+      if (names == null) return null;
+
+      final map = <String, Object?>{};
+      for (final name in names) {
+        final value = _newSlot();
+        try {
+          final namePtr = name.toNativeUtf8();
+          try {
+            _bridge.getProp(_ctxPointer, slot, namePtr, value);
+          } finally {
+            malloc.free(namePtr);
+          }
+          map[name] = _jsToDart(value, cx);
+        } finally {
+          _bridge.freeValue(_ctxPointer, value);
+          _bridge.freeSlot(value);
+        }
+      }
+      return map;
+    } finally {
+      cx.active.remove(identity);
+      cx.depth--;
     }
-    return map;
   }
 
   /// 尝试把 JS 值读成 Uint8List（Uint8Array / ArrayBuffer）。
@@ -814,9 +931,21 @@ class QuickjsEngine implements JsEngine {
         _bridge.makeUndefined(out);
       case bool b:
         _bridge.makeBool(_ctxPointer, out, b ? 1 : 0);
+      case DateTime d:
+        _bridge.newDate(_ctxPointer, d.millisecondsSinceEpoch.toDouble(), out);
       case int i:
         if (i >= -2147483648 && i <= 2147483647) {
           _bridge.makeInt32(_ctxPointer, out, i);
+        } else if (i > 9007199254740991 || i < -9007199254740991) {
+          // 超出 ±2^53（JSON 安全整数）：转 BigInt 保精度，降 double 丢位
+          // （fjs 同款策略）
+          final text = i.toString();
+          final ptr = text.toNativeUtf8();
+          try {
+            _bridge.newBigInt(_ctxPointer, ptr, _utf8Len(text), out);
+          } finally {
+            malloc.free(ptr);
+          }
         } else {
           _bridge.makeFloat64(_ctxPointer, out, i.toDouble());
         }
@@ -880,35 +1009,131 @@ class QuickjsEngine implements JsEngine {
     }
   }
 
-  String _takeExceptionMessage() {
-    final exc = _newSlot();
+  /// 取走 pending 异常并拆解为结构化 [JsEvalException]（fjs error.rs
+  /// from_exception 的移植：name/message/stack 一次取全，按 name 归类，
+  /// syntax 错误从 stack 解析行号/列号）。
+  JsEvalException _takeException() {
+    final namePtr = malloc<Pointer<Utf8>>();
+    final msgPtr = malloc<Pointer<Utf8>>();
+    final stackPtr = malloc<Pointer<Utf8>>();
     try {
-      _bridge.getException(_ctxPointer, exc);
-      final direct = _readCString(exc);
-      if (direct != null) return direct;
-      // JS_ToCString 对部分异常（挂起嵌套等）失败——按名取 message/stack
-      // 字段兜底，避免真实错误被 'JS exception' 兜底文本吞掉（真机排障
-      // 实锤：category 失败只剩无信息兜底文本）
-      final msgSlot = _newSlot();
-      try {
-        for (final field in const ['message', 'stack']) {
-          final namePtr = field.toNativeUtf8();
-          try {
-            _bridge.getProp(_ctxPointer, exc, namePtr, msgSlot);
-          } finally {
-            malloc.free(namePtr);
-          }
-          final v = _readCString(msgSlot);
-          if (v != null && v.isNotEmpty) return '$field: $v';
-        }
-      } finally {
-        _bridge.freeValue(_ctxPointer, msgSlot);
-      }
-      return 'JS exception';
+      _bridge.getExceptionDetails(_ctxPointer, namePtr, msgPtr, stackPtr);
+      return _buildException(
+        _optNativeText(namePtr.value),
+        _optNativeText(msgPtr.value),
+        _optNativeText(stackPtr.value),
+      );
     } finally {
-      _bridge.freeValue(_ctxPointer, exc);
-      _bridge.freeSlot(exc);
+      malloc
+        ..free(namePtr)
+        ..free(msgPtr)
+        ..free(stackPtr);
     }
+  }
+
+  /// 从 promise rejection reason 值构造结构化异常。
+  JsEvalException _exceptionFromValue(Pointer<QjsValue> reason) {
+    final text = _readCString(reason);
+    return _buildException(
+      _readPropText(reason, 'name'),
+      _readPropText(reason, 'message'),
+      _readPropText(reason, 'stack'),
+      fallbackText: text,
+    );
+  }
+
+  String? _readPropText(Pointer<QjsValue> obj, String prop) {
+    final slot = _newSlot();
+    try {
+      final namePtr = prop.toNativeUtf8();
+      try {
+        _bridge.getProp(_ctxPointer, obj, namePtr, slot);
+      } finally {
+        malloc.free(namePtr);
+      }
+      if (_bridge.getTag(slot) == QjsTag.undefined) return null;
+      return _readCString(slot);
+    } finally {
+      _bridge.freeValue(_ctxPointer, slot);
+      _bridge.freeSlot(slot);
+    }
+  }
+
+  String? _optNativeText(Pointer<Utf8> p) {
+    if (p == nullptr) return null;
+    final s = p.toDartString();
+    _bridge.freeBuffer(p.cast());
+    return s;
+  }
+
+  JsEvalException _buildException(
+    String? name,
+    String? message,
+    String? stack, {
+    String? fallbackText,
+  }) {
+    final kind = _classifyError(name, message, _deadlineActive);
+    final pos =
+        kind == JsErrorKind.syntax && stack != null ? _parseStackPosition(stack) : null;
+    final text = (message != null && message.isNotEmpty)
+        ? (name != null ? '$name: $message' : message)
+        : (fallbackText != null && fallbackText.isNotEmpty
+            ? fallbackText
+            : 'JS exception');
+    return JsEvalException(
+      text,
+      name: name,
+      stack: stack,
+      line: pos?.$1,
+      column: pos?.$2,
+      errorKind: kind,
+    );
+  }
+
+  /// 按 Error.name 归类（fjs 分类表的最小移植）。本内核栈溢出/中断/OOM
+  /// 都走 InternalError（JS 侧无 InternalError 构造器，用户抛不出，
+  /// 不需要 fjs 那套防伪造消息匹配）；TypeError/ReferenceError 等用户可
+  /// throw 伪造，但对诊断只影响分类字符串，不影响行为。
+  static JsErrorKind _classifyError(
+      String? name, String? message, bool inDeadline) {
+    switch (name) {
+      case 'SyntaxError':
+        return JsErrorKind.syntax;
+      case 'TypeError':
+        return JsErrorKind.type;
+      case 'ReferenceError':
+        return JsErrorKind.reference;
+      case 'RangeError':
+        return JsErrorKind.range;
+      case 'InternalError':
+        if (message != null) {
+          if (message.contains('stack overflow')) {
+            return JsErrorKind.stackOverflow;
+          }
+          if (message.contains('out of memory')) {
+            return JsErrorKind.memoryLimit;
+          }
+          if (message.contains('interrupted')) {
+            return inDeadline ? JsErrorKind.timeout : JsErrorKind.interrupted;
+          }
+        }
+        return JsErrorKind.generic;
+      default:
+        return JsErrorKind.generic;
+    }
+  }
+
+  /// 从 stack 首帧解析位置，支持 `at fn (file:line:col)` 与 `at file:line:col`
+  /// 两种形态（fjs parse_stack_position 同款）。
+  static (int, int)? _parseStackPosition(String stack) {
+    for (final line in stack.split('\n')) {
+      final m = RegExp(r'\(([^()]+):(\d+):(\d+)\)').firstMatch(line) ??
+          RegExp(r'at\s+([^(\s]+):(\d+):(\d+)').firstMatch(line);
+      if (m != null) {
+        return (int.parse(m.group(2)!), int.parse(m.group(3)!));
+      }
+    }
+    return null;
   }
 
   void _checkDisposed() {
@@ -928,11 +1153,70 @@ class _QuickjsFactory implements JsEngineFactory {
       QuickjsEngine.createWith(config, libPath: libPath);
 }
 
-/// evaluate / compile 失败时抛出，message 为 JS 异常文本。
+/// evaluate / compile / call 失败时抛出。
+///
+/// [message] 为 "Name: message"（或兜底 coerce 文本）；[name] / [stack] 来自
+/// JS Error 对象；[line] / [column] 由 stack 首帧解析（syntax 错误）；
+/// [errorKind] 为结构化分类（fjs JsError 的最小移植）。
 class JsEvalException implements Exception {
-  JsEvalException(this.message);
+  JsEvalException(
+    this.message, {
+    this.name,
+    this.stack,
+    this.line,
+    this.column,
+    this.errorKind = JsErrorKind.generic,
+  });
+
   final String message;
+  final String? name;
+  final String? stack;
+  final int? line;
+  final int? column;
+  final JsErrorKind errorKind;
 
   @override
   String toString() => 'JsEvalException: $message';
+}
+
+/// JS 异常的结构化分类。
+enum JsErrorKind {
+  /// 墙钟超时被打断（JsEngineConfig.timeoutMs）。
+  timeout,
+
+  /// 手动中断（非超时场景的 interrupted）。
+  interrupted,
+
+  /// 引擎栈溢出（InternalError: stack overflow）。
+  stackOverflow,
+
+  /// 内存水位触顶（InternalError: out of memory）。
+  memoryLimit,
+
+  /// 语法错误（可从 stack 取行号/列号）。
+  syntax,
+
+  /// TypeError。
+  type,
+
+  /// ReferenceError。
+  reference,
+
+  /// RangeError（用户主动抛出等）。
+  range,
+
+  /// 其余（用户 Error/字符串抛出等）。
+  generic,
+}
+
+/// 值转换护栏状态（fjs ConversionState 同款）：循环引用检测 +
+/// 深度/节点上限。按次新建、逐层传参——宿主回调里可再嵌套 evaluate
+/// （重入），不能放引擎字段。
+class _Conv {
+  static const maxDepth = 128;
+  static const maxNodes = 100000;
+
+  int depth = 0;
+  int nodes = 0;
+  final active = <int>{};
 }
