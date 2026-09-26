@@ -153,10 +153,13 @@ void main() {
   });
 
   group('模块求值', () {
-    // evaluateModule 返回的是**模块命名空间对象**（不是 default 导出值）——
-    // 爬虫源的正确用法是靠副作用注册全局（见 DsPlayer 的 js_spider.dart：
-    // `_engine.evaluateModule(src, fileName: api)` 忽略返回值），所以这里
-    // 验的是「模块体真的执行了 + 返回命名空间」而非取 default。
+    // evaluateModule 返回的是**模块 evaluation promise 的 settle 值**
+    // （内核为支持顶层 await，模块求值走 promise 路径，settle 值为
+    // undefined → Dart null）。爬虫源的正确用法是靠副作用注册全局
+    // （见 DsPlayer 的 js_spider.js：evaluateModule(src) 忽略返回值）。
+    // 注意：不要断言「返回模块命名空间对象」——导出的 namespace 无法
+    // 跨 FFI 枚举（JS_GPN_ENUM_ONLY 对导出为空），旧版返回空 Map 只是
+    // promise 被误当普通对象转换的侥幸结果。
     test('执行模块体（副作用注册全局）', () {
       final out = engine.evaluateModule(
         'globalThis.moduleRan = true;',
@@ -164,26 +167,21 @@ void main() {
       );
       expect(engine.getGlobalProperty('moduleRan'), isTrue,
           reason: '模块体应已执行');
-      expect(out, isA<Map>(), reason: '返回模块命名空间对象');
+      expect(out, isNull, reason: '模块 promise settle 值为 undefined');
     });
 
-    test('模块内的 export 可从全局读到（模块体副作用可见）', () {
-      // 注：**不要**断言「evaluateModule 的返回值里能读到 default」——
-      // 该返回值的属性枚举走 `JS_GPN_ENUM_ONLY`（C 侧 qjs_own_property_names），
-      // 而 ES 模块命名空间的导出不满足该标志，枚举结果为空。
-      // 这正是爬虫源不依赖返回值、而靠模块体写全局的原因（见 js_spider.dart）。
-      // 这里验「模块体执行 → 结果落在全局」这条真实通路。
+    test('模块执行完成且异常会浮出', () {
       engine.evaluateModule(
         'export const answer = 6 * 7;',
         fileName: 'export_const.js',
       );
-      // 模块内导出不是全局；此处用例的真实目的 = 确认返回值是命名空间形态
-      // 且模块已正常执行完（无异常抛出）
+      // 模块体执行完毕（含导出声明），无异常抛出即为成功；
+      // 结果落在全局的通路单独验证：
       final out = engine.evaluateModule(
         'globalThis.exported = 42;',
         fileName: 'export_to_global.js',
       );
-      expect(out, isA<Map>(), reason: '返回模块命名空间对象');
+      expect(out, isNull);
       expect(engine.getGlobalProperty('exported'), 42,
           reason: '模块体副作用应生效');
     });
