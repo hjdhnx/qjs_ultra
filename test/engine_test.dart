@@ -226,13 +226,24 @@ group('结构化错误（fjs JsError 对齐）', () {
   });
 
   test('栈溢出归类 stackOverflow 且引擎可复用', () {
+    // JS 栈上限必须显著小于宿主线程实际栈（fjs 同款告诫：否则保护
+    // 来不及触发就是宿主段错误而非可捕获 RangeError）。测试 isolate
+    // 线程栈无富余，用 128KB 小栈让引擎保护稳定先行。
+    final e2 = QuickjsEngine.createWith(
+      const JsEngineConfig(stackSize: 128 * 1024),
+      libPath: libPath,
+    );
     try {
-      engine.evaluate('(function f(){ f() })()');
-      fail('应抛 JsEvalException');
-    } on JsEvalException catch (e) {
-      expect(e.errorKind, JsErrorKind.stackOverflow);
+      try {
+        e2.evaluate('(function f(){ f() })()');
+        fail('应抛 JsEvalException');
+      } on JsEvalException catch (e) {
+        expect(e.errorKind, JsErrorKind.stackOverflow);
+      }
+      expect(e2.evaluate('1 + 1'), 2, reason: '溢出后上下文应仍可用');
+    } finally {
+      e2.dispose();
     }
-    expect(engine.evaluate('1 + 1'), 2, reason: '溢出后上下文应仍可用');
   });
 });
 
