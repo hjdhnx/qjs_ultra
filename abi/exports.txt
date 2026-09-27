@@ -9,6 +9,7 @@
 # 详见 README「ABI 契约」与 DsPlayer docs/plugin/QJS-PLUGIN-DESIGN.md。
 #
 
+qjs_alloc_buffer
 qjs_array_length
 qjs_bridge_new_uint8_array
 qjs_call

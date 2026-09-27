@@ -1013,7 +1013,9 @@ if (typeof globalThis.btoa === 'undefined') {
     // 避免多余的 WriteObject/ReadObject 往返与 loader 内 ResolveModule）。
     final bytes = loader.getModuleBytecode(name);
     if (bytes != null) {
-      final buf = malloc<Uint8>(bytes.length);
+      // C 堆分配（qjs_alloc_buffer）：C 侧 loader trampoline 会 free——
+      // Dart malloc 与 MinGW DLL 堆不同源，跨堆 free 在 Windows 上崩
+      final buf = _bridge.allocBuffer(bytes.length).cast<Uint8>();
       buf.asTypedList(bytes.length).setAll(0, bytes);
       outBuf.value = buf;
       outLen.value = bytes.length;
@@ -1022,7 +1024,7 @@ if (typeof globalThis.btoa === 'undefined') {
     final source = loader.getModuleSource(name);
     if (source == null) return 0;
     final srcBytes = utf8.encode(source);
-    final buf = malloc<Uint8>(srcBytes.length);
+    final buf = _bridge.allocBuffer(srcBytes.length).cast<Uint8>();
     buf.asTypedList(srcBytes.length).setAll(0, srcBytes);
     outBuf.value = buf;
     outLen.value = srcBytes.length;
@@ -1053,7 +1055,11 @@ if (typeof globalThis.btoa === 'undefined') {
       basePtr.toDartString(),
       namePtr.toDartString(),
     );
-    final ptr = normalized.toNativeUtf8();
+    final bytes = utf8.encode(normalized);
+    // C 堆分配（qjs_alloc_buffer）：C 侧 trampoline 会 free（跨堆 free 会崩）
+    final ptr = _bridge.allocBuffer(bytes.length + 1).cast<Uint8>();
+    ptr.asTypedList(bytes.length).setAll(0, bytes);
+    ptr[bytes.length] = 0;
     out.value = ptr.cast();
     return 1;
   }

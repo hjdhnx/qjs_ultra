@@ -833,6 +833,15 @@ QJS_API int32_t qjs_memory_usage(JSRuntime *rt, int64_t *malloc_size,
 
 QJS_API void qjs_free_buffer(void *p) { free(p); }
 
+/* C 堆分配（供 Dart 侧向 C 移交数据的缓冲：模块源/bytecode、normalize 结果）。
+ * 必须用本函数而非 Dart malloc——Windows 上 dart.exe（ucrt）与 MinGW DLL
+ * （msvcrt）堆不同源，Dart 分配的指针经 C free 会堆损坏（0xC0000005 实锤）。
+ * Android bionic 全进程同堆，所以该 bug 只在 Windows 链路暴露。 */
+QJS_API void *qjs_alloc_buffer(int32_t size) {
+  if (size < 0) return NULL;
+  return malloc((size_t)size);
+}
+
 /* ---------- 二进制 / 数组判定（Dart 桥接契约补充） ---------- */
 
 /* JS IsArray 精确判定（引擎内置语义，非 length 属性猜测） */

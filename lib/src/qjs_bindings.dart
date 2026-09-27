@@ -376,6 +376,9 @@ class QjsBridge {
                 Int32 Function(Pointer<Void>, Int32, Int32,
                     Pointer<QjsValue>)>>('qjs_settle_pending')
         .asFunction();
+    allocBuffer = _lk<NativeFunction<Pointer<Void> Function(Int32)>>(
+            'qjs_alloc_buffer')
+        .asFunction();
   }
 
   /// 释放 Dart 侧的 JSValue 槽内存。
@@ -483,6 +486,7 @@ class QjsBridge {
       Pointer<Void>, Pointer<QjsValue>, Pointer<Int32>) newPendingPromise;
   late final int Function(
       Pointer<Void>, int, int, Pointer<QjsValue>) settlePending;
+  late final Pointer<Void> Function(int) allocBuffer;
 
   static QjsBridge? _instance;
 
