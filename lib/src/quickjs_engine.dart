@@ -638,8 +638,7 @@ class QuickjsEngine implements JsEngine {
     }
     _pumpUntilIdle(); // settle 后泵微任务，推进 JS await 链
     _asyncInFlight.remove(pid);
-    _signalActivity();
-  }
+    _signalActivity();  }
 
   /// 后台泵：job 异常吞进 [drainBackgroundErrors]（无前台调用方可抛）。
   /// 重入保护：泵中触发的新 job 由外层循环继续消费（单 isolate 无并发）。
@@ -740,6 +739,7 @@ class QuickjsEngine implements JsEngine {
       if (state != 0) break;
       if (_asyncInFlight.isNotEmpty) {
         await _waitForActivity();
+        state = _bridge.getPromiseState(_ctxPointer, slot);
         continue;
       }
       break;
@@ -792,23 +792,29 @@ class QuickjsEngine implements JsEngine {
 
   /// 安装 setTimeout/clearTimeout 宿主实现（Dart Timer 驱动）。回调经
   /// [callAsync] 执行：回调内 await 异步宿主函数可正常驱动；回调异常进
-  /// 后台错误（对齐 fjs guarded timers 语义）。setInterval 未提供
-  /// （drpy3 bundle 无引用；需要时再加）。
+  /// 后台错误（对齐 fjs guarded timers 语义）。未触发的 Timer 计入
+  /// in-flight 活动集——evaluateAsync/callAsync 的前台泵会等它，而不是
+  /// 队空提前放弃。setInterval 未提供（drpy3 bundle 无引用；需要时再加）。
   void installTimers() {
     registerFunction('__qjs_setTimeout', (args) {
       final fn = args.isNotEmpty ? args[0] : null;
       final ms = args.length > 1 ? (args[1] as num?)?.toInt() ?? 0 : 0;
       if (fn is! JsFunctionRef) return 0;
       final id = _nextTimerId++;
+      _asyncInFlight.add(-id); // 负数与桥 pid 区分：未触发 Timer 是未来活动
       _timers[id] = Timer(Duration(milliseconds: ms), () {
         _timers.remove(id);
-        unawaited(_fireTimer(fn));
+        unawaited(_fireTimer(fn, -id));
       });
       return id;
     });
     registerFunction('__qjs_clearTimeout', (args) {
       final id = args.isNotEmpty ? args[0] as num? : null;
-      _timers.remove(id?.toInt() ?? 0)?.cancel();
+      final t = _timers.remove(id?.toInt() ?? 0);
+      if (t != null) {
+        t.cancel();
+        if (_asyncInFlight.remove(-(id!.toInt()))) _signalActivity();
+      }
       return null;
     });
     evaluate(
@@ -817,11 +823,14 @@ class QuickjsEngine implements JsEngine {
     );
   }
 
-  Future<void> _fireTimer(JsFunctionRef fn) async {
+  Future<void> _fireTimer(JsFunctionRef fn, int key) async {
     try {
       await callAsync(fn, const []);
     } catch (e) {
       _backgroundErrors.add('timer: $e');
+    } finally {
+      _asyncInFlight.remove(key);
+      _signalActivity();
     }
   }
 
@@ -852,6 +861,20 @@ if (typeof globalThis.btoa === 'undefined') {
 ''');
   }
 
+  /// 注册源码模块供动态 `import(name)` 加载（对齐 fjs declareNewModule；
+  /// drpy3 胶水的 evalModule 经此注册源）。名字一经 import 不可替换
+  /// （quickjs 模块缓存语义）——源热更需要用新名字重建调用。
+  void registerModule(String name, String source) {
+    final existing = _moduleLoader;
+    if (existing == null) {
+      _moduleLoader = _InlineModuleLoader({name: source});
+    } else if (existing is _InlineModuleLoader) {
+      existing.modules[name] = source;
+    } else {
+      throw StateError('registerModule 与自定义 JsModuleLoader 冲突');
+    }
+  }
+
   /// 装载 ESM 模块源码（经内置模块表）并把 [exports] 导出挂为
   /// `__<导出名>` 全局函数——qjs_ultra 没有 rquickjs 的
   /// `engine.call(module, method)` 调度面，drpy3 六环节经此暴露
@@ -869,14 +892,7 @@ if (typeof globalThis.btoa === 'undefined') {
       'drpy3StoreImport',
     ],
   }) {
-    final existing = _moduleLoader;
-    if (existing == null) {
-      _moduleLoader = _InlineModuleLoader({moduleName: source});
-    } else if (existing is _InlineModuleLoader) {
-      existing.modules[moduleName] = source;
-    } else {
-      throw StateError('loadModuleToGlobals 与自定义 JsModuleLoader 冲突');
-    }
+    registerModule(moduleName, source);
     final attach = exports.map((e) => 'g.__$e = m.$e;').join('\n  ');
     return evaluateAsync('''
 (async () => {

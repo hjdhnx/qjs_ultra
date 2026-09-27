@@ -171,6 +171,7 @@ void main() {
       }
 
       // ① shim（fjs 桥 + timers + atob/btoa 兜底）
+      var moduleSeq = 0;
       engine.installDrpy3Shim((message) async {
         final msg = message as Map;
         switch (msg['action']) {
@@ -183,7 +184,10 @@ void main() {
           case 'getProxy':
             return '';
           case 'evalModule':
-            return '';
+            // 对齐 DsPlayer Drpy3Host：注册源模块并回传名字，胶水 import(name)
+            final name = 'drpy3_src_${moduleSeq++}';
+            engine.registerModule(name, msg['code'] as String);
+            return name;
           default:
             return null;
         }

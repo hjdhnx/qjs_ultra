@@ -11,7 +11,7 @@ void main() {
   setUp(() {
     engine = QuickjsEngine.createWith(const JsEngineConfig(), libPath: libPath);
   });
-  tearDown(() => engine.dispose);
+  tearDown(() => engine.dispose());
 
   test('A. 单行副作用（engine_test 原样）', () {
     engine.evaluateModule('globalThis.moduleRan = true;', fileName: 'a.js');
@@ -28,7 +28,7 @@ globalThis.__getRule = function () { return JSON.stringify(rule); };
 globalThis.__moduleRan = true;
 ''';
     engine.evaluateModule(src, fileName: 'b.js');
-    expect(engine.getGlobalProperty('moduleRan'), isTrue, reason: '模块体应执行');
+    expect(engine.getGlobalProperty('__moduleRan'), isTrue, reason: '模块体应执行');
   });
 
   test('C. 完整链：init direct-eval 装载规则源', () {
