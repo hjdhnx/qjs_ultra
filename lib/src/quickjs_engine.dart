@@ -858,6 +858,15 @@ if (typeof globalThis.btoa === 'undefined') {
     return out;
   };
 }
+// setImmediate/clearImmediate：emscripten 胶水的 nextTick 探测/直接引用需要
+// （央视频 _lib.cctv.worker.new.js 执行即报 "'setImmediate' is not defined"，
+// 2026-09-28 实锤）。引擎只有 setTimeout 系，用 0ms 等价模拟。
+// ⚠️ 勿用箭头函数 rest 参数（...args）——so 内置 quickjs 对该写法求值报
+// "expecting ';'"（语法子集兼容坑，function 形态无此问题）
+if (typeof globalThis.setImmediate === 'undefined') {
+  globalThis.setImmediate = function (fn) { return setTimeout(fn, 0); };
+  globalThis.clearImmediate = function (id) { clearTimeout(id); };
+}
 ''');
   }
 
