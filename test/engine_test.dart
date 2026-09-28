@@ -1,4 +1,5 @@
 // ignore_for_file: cascade_invocations
+import 'dart:convert' show jsonEncode;
 import 'dart:io';
 
 import 'package:qjs_ultra/qjs_ultra.dart';
@@ -384,6 +385,51 @@ group('GC 阈值', () {
     } finally {
       e2.dispose();
     }
+  });
+});
+
+group('cheerio :gt/:lt 切片（jQuery 语义）', () {
+  const html = '<ul><li>a</li><li>b</li><li>c</li><li>d</li></ul>';
+
+  late QuickjsEngine engine;
+  setUp(() {
+    engine = QuickjsEngine.createWith(const JsEngineConfig(), libPath: libPath);
+  });
+  tearDown(() => engine.dispose());
+
+  Object? sel(String selector) => engine.evaluate(
+      '(() => { const \$ = cheerio.load(${jsonEncode(html)}); return \$("$selector").length; })()');
+
+  test('选择器伪类 :gt / :lt', () {
+    expect(sel('li:gt(1)'), 2, reason: 'gt(1) → 索引 2,3');
+    expect(sel('li:lt(2)'), 2, reason: 'lt(2) → 索引 0,1');
+    expect(sel('li:gt(3)'), 0);
+    expect(sel('li:lt(0)'), 0);
+  });
+
+  test('负索引从末尾计数', () {
+    expect(sel('li:gt(-2)'), 1, reason: 'gt(-2) → 索引 3');
+    expect(sel('li:lt(-1)'), 3, reason: 'lt(-1) → 索引 0,1,2');
+    expect(sel('li:gt(-9)'), 4, reason: '极负越界 → 全部（对齐 jQuery）');
+    expect(sel('li:lt(-9)'), 0, reason: '极负越界 → 空');
+  });
+
+  test('链式方法 .gt / .lt 与切片组合', () {
+    expect(
+      engine.evaluate(
+          '(() => { const \$ = cheerio.load(${jsonEncode(html)});'
+          ' return \$("li").gt(1).lt(3).length; })()'),
+      2, reason: 'gt(1).lt(3) → 索引 1,2（slice 语义）');
+    expect(
+      engine.evaluate(
+          '(() => { const \$ = cheerio.load(${jsonEncode(html)});'
+          ' return \$("li").lt(-1).length; })()'),
+      3, reason: 'lt(-1) → 去尾');
+    expect(
+      engine.evaluate(
+          '(() => { const \$ = cheerio.load(${jsonEncode(html)});'
+          ' return \$("li").gt(-2).text(); })()'),
+      'd', reason: 'gt(-2) → 最后一个');
   });
 });
 }

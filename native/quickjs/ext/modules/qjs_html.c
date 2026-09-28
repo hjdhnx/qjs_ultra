@@ -225,7 +225,9 @@ typedef enum {
     QJS_POS_LAST,
     QJS_POS_EQ,
     QJS_POS_EVEN,
-    QJS_POS_ODD
+    QJS_POS_ODD,
+    QJS_POS_GT,
+    QJS_POS_LT
 } qjs_pos_filter_t;
 
 /* Forward declarations */
@@ -371,6 +373,21 @@ static char *qjs_preprocess_selector(const char *sel, size_t len,
                     continue;
                 }
             }
+            /* :gt(n) / :lt(n) */
+            if (i + 4 < len && (memcmp(sel + i, ":gt(", 4) == 0 ||
+                                memcmp(sel + i, ":lt(", 4) == 0)) {
+                size_t j = i + 4;
+                int val = 0;
+                bool neg = false;
+                if (j < len && sel[j] == '-') { neg = true; j++; }
+                while (j < len && isdigit(sel[j])) { val = val * 10 + (sel[j] - '0'); j++; }
+                if (j < len && sel[j] == ')') {
+                    *filter = (sel[i+1] == 'g') ? QJS_POS_GT : QJS_POS_LT;
+                    *param = neg ? -val : val;
+                    i = j + 1;
+                    continue;
+                }
+            }
             /* :contains("text") or :contains(text) — extract text, strip from selector */
             if (i + 9 < len && memcmp(sel + i, ":contains(", 10) == 0) {
                 size_t j = i + 10;
@@ -464,6 +481,27 @@ static void qjs_apply_pos_filter(qjs_col_t *col, qjs_pos_filter_t filter, int pa
             } else {
                 col->count = 0;
             }
+            break;
+        }
+        case QJS_POS_GT: {
+            /* keep nodes with index > param（负索引从末尾计数；
+             * 极负越界时索引恒 > p → 保留全部，对齐 jQuery 与 .gt()） */
+            int p = param;
+            if (p < 0) p += (int)col->count;
+            size_t start = (p < 0) ? 0 : (size_t)p + 1;
+            size_t w = 0;
+            for (size_t r = (start < col->count) ? start : col->count;
+                 r < col->count; r++)
+                col->nodes[w++] = col->nodes[r];
+            col->count = w;
+            break;
+        }
+        case QJS_POS_LT: {
+            int p = param;
+            if (p < 0) p += (int)col->count;
+            if (p < 0) p = 0;
+            if ((size_t)p > col->count) p = (int)col->count;
+            col->count = (size_t)p;
             break;
         }
         case QJS_POS_EVEN: {
@@ -1423,7 +1461,34 @@ static JSValue qjs_ch_eq(JSContext *ctx, JSValueConst this_val,
         return qjs_cheerio_wrap(ctx, ch->doc, NULL, 0);
     return qjs_cheerio_wrap(ctx, ch->doc, &ch->nodes[idx], 1);
 }
-
+/* .gt(n): 取索引严格大于 n 的元素集合（负索引从末尾计数） */
+static JSValue qjs_ch_gt(JSContext *ctx, JSValueConst this_val,
+                         int argc, JSValueConst *argv)
+{
+    qjs_cheerio_t *ch = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_CHEERIO);
+    if (!ch) return JS_ThrowInternalError(ctx, "not a cheerio object");
+    int32_t n;
+    if (argc < 1 || JS_ToInt32(ctx, &n, argv[0])) return JS_EXCEPTION;
+    if (n < 0) n += (int32_t)ch->count;
+    if (n < 0) n = -1;  /* 所有元素索引都 > 负数下界 */
+    size_t start = (size_t)n + 1;
+    if ((int32_t)n >= 0 && start >= ch->count)
+        return qjs_cheerio_wrap(ctx, ch->doc, NULL, 0);
+    return qjs_cheerio_wrap(ctx, ch->doc, &ch->nodes[start], ch->count - start);
+}
+/* .lt(n): 取索引严格小于 n 的元素集合（负索引从末尾计数） */
+static JSValue qjs_ch_lt(JSContext *ctx, JSValueConst this_val,
+                         int argc, JSValueConst *argv)
+{
+    qjs_cheerio_t *ch = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_CHEERIO);
+    if (!ch) return JS_ThrowInternalError(ctx, "not a cheerio object");
+    int32_t n;
+    if (argc < 1 || JS_ToInt32(ctx, &n, argv[0])) return JS_EXCEPTION;
+    if (n < 0) n += (int32_t)ch->count;
+    if (n <= 0) return qjs_cheerio_wrap(ctx, ch->doc, NULL, 0);
+    if ((size_t)n > ch->count) n = (int32_t)ch->count;
+    return qjs_cheerio_wrap(ctx, ch->doc, &ch->nodes[0], (size_t)n);
+}
 /* .get(i) */
 static JSValue qjs_ch_get(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
@@ -3058,6 +3123,8 @@ static const JSCFunctionListEntry qjs_cheerio_proto[] = {
     JS_CFUNC_DEF("first",       0, qjs_ch_first ),
     JS_CFUNC_DEF("last",        0, qjs_ch_last ),
     JS_CFUNC_DEF("eq",          1, qjs_ch_eq ),
+    JS_CFUNC_DEF("gt",          1, qjs_ch_gt ),
+    JS_CFUNC_DEF("lt",          1, qjs_ch_lt ),
     JS_CFUNC_DEF("get",         1, qjs_ch_get ),
     JS_CFUNC_DEF("each",        1, qjs_ch_each ),
     JS_CFUNC_DEF("map",         1, qjs_ch_map ),
