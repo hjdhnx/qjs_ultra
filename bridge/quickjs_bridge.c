@@ -488,6 +488,23 @@ static JSModuleDef *module_loader_trampoline(JSContext *ctx,
     }
   } else {
     /* ---- 源码模式（对齐 Java 版 getModuleStringCode 分支） ---- */
+    /* quickjs 契约（quickjs.c __JS_EvalInternal）：input 必须满足
+     * input[input_len]=='\0'——lexer 的 next_token 顶端无条件 *p 解引用，
+     * 以 *p==0 && p>=buf_end 判 EOF。Dart 侧 allocBuffer(len) 按「len 字节、
+     * 无终结符」的回调契约分配，缺终结符时 lexer 读穿 buf 把相邻堆字节
+     * 当源码继续解析——源码模式随机假语法错误的根因（bytecode 模式走
+     * JS_ReadObject 长度界读，不受影响）。这里统一拷贝补齐终结符再交
+     * 引擎，原 buf 即刻归还；下方两处 free(buf) 释放的是本副本。 */
+    char *nt = (char *)malloc((size_t)len + 1);
+    if (!nt) {
+      free(buf);
+      JS_ThrowOutOfMemory(ctx);
+      return NULL;
+    }
+    memcpy(nt, buf, (size_t)len);
+    nt[len] = '\0';
+    free(buf);
+    buf = (uint8_t *)nt;
     const char *script = (const char *)buf;
     size_t script_len = (size_t)len;
     int res = js_module_test_json(ctx, attributes);

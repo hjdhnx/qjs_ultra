@@ -1053,7 +1053,7 @@ if (typeof globalThis.setImmediate === 'undefined') {
     buf.asTypedList(srcBytes.length).setAll(0, srcBytes);
     outBuf.value = buf;
     outLen.value = srcBytes.length;
-    return 2; // 源码文本
+    return 2; // 源码文本（len 字节、无 NUL；终结符由 C 侧 trampoline 统一补齐）
   }
 
   int _normalizeImpl(
