@@ -269,7 +269,8 @@ QJS_API int32_t qjs_poll_rejection(JSRuntime *rt, char **out,
  * 迁移后求值线程的栈位置与基线差随机超过许可线 → 假 stack overflow
  * （drpy3 worker isolate 真机实锤：512MB 许可仍炸，md5 级浅调用即触发）。
  * 宿主在每次进入引擎求值前调用本函数，以当前线程重算基线。
- * quickjs-ng 原生 API（quickjs.h JS_UpdateStackTop）。 */
+ * 本仓 quickjs 定制版自带 API（quickjs.h JS_UpdateStackTop，
+ * native/quickjs/quickjs.c JS_UpdateStackTop 实现）。 */
 QJS_API void qjs_update_stack_top(void *rt_ptr) {
   JSRuntime *rt = (JSRuntime *)rt_ptr;
   if (rt) JS_UpdateStackTop(rt);
