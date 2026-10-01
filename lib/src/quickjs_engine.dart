@@ -653,6 +653,12 @@ class QuickjsEngine implements JsEngine {
     _pumping = true;
     try {
       for (;;) {
+        // 栈基线刷新（isolate 线程迁移）：本泵是异步桥的续跑主通道
+        // （bridge settle 后推进 JS await 链）——settle 可能发生在迁移后
+        // 的线程，旧基线在新线程上随机误判 stack overflow（drpy3 worker
+        // 真机实锤，home/category 随机红）。每轮以当前线程重算。
+        final refresh = _bridge.updateStackTop;
+        if (refresh != null) refresh(_rt);
         final rc = _bridge.executePendingJob(_rt);
         if (rc == 0) return;
         if (rc < 0) _backgroundErrors.add(_takeException().toString());
