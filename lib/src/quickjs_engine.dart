@@ -772,7 +772,10 @@ class QuickjsEngine implements JsEngine {
     // overflow（512MB 许可仍炸，drpy3 worker isolate 真机实锤，md5 级
     // 浅调用即触发）。每入口以当前线程重算基线，彻底根治；顺带根治
     // dr2（qjs_worker）的偶发假爆栈。开销 = 一次取址，纳秒级。
-    _bridge.updateStackTop(_rt);
+    // 旧 so 无此导出时为 null（降级不刷新，功能可用）——上层可用
+    // hasStackTopRefresh 探测并提示升级插件。
+    final refresh = _bridge.updateStackTop;
+    if (refresh != null) refresh(_rt);
     final timeout = _config.timeoutMs;
     final useDeadline = timeout != null && timeout > 0;
     if (useDeadline) {
@@ -789,6 +792,11 @@ class QuickjsEngine implements JsEngine {
       }
     }
   }
+
+  /// so 是否支持栈基线刷新（qjs_update_stack_top，so 1.0.5+）。
+  /// false = 加载的 so 过旧：功能可用但线程迁移宿主存在假 stack overflow
+  /// 风险，宿主应提示升级 QJS 插件。
+  bool get hasStackTopRefresh => _bridge.updateStackTop != null;
 
   /// 排空后台错误（后台泵吞掉的 job 异常 + timer 回调异常）。
   List<String> drainBackgroundErrors() {

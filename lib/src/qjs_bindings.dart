@@ -67,10 +67,17 @@ class QjsBridge {
   QjsBridge._(this._lib) {
     Pointer<T> _lk<T extends NativeType>(String n) => _lib.lookup<T>(n);
 
-    updateStackTop =
-        _lk<NativeFunction<Void Function(Pointer<Void>)>>(
-            'qjs_update_stack_top')
-        .asFunction();
+    // 可选符号（2026-10-01）：旧 so（<1.0.5）无此导出——缺失时置 null
+    // 降级为「不刷新栈基线」（回退旧行为），宿主继续可用；用 try/catch
+    // 而非预检，避免对同一符号做两次 lookup。新 so（1.0.5+）必有。
+    try {
+      updateStackTop =
+          _lk<NativeFunction<Void Function(Pointer<Void>)>>(
+                  'qjs_update_stack_top')
+              .asFunction();
+    } on ArgumentError {
+      updateStackTop = null;
+    }
     newRuntime =
         _lk<NativeFunction<Pointer<Void> Function()>>('qjs_new_runtime')
             .asFunction();
@@ -390,7 +397,9 @@ class QjsBridge {
 
   final DynamicLibrary _lib;
 
-  late final void Function(Pointer<Void>) updateStackTop;
+  /// 可选增强：栈基线刷新（isolate 线程迁移假爆栈根治，so 1.0.5+）。
+  /// null = so 过旧无此导出，宿主应提示升级（QuickjsEngine.hasStackTopRefresh）。
+  void Function(Pointer<Void>)? updateStackTop;
   late final Pointer<Void> Function() newRuntime;
   late final void Function(Pointer<Void>) freeRuntime;
   late final Pointer<Void> Function(Pointer<Void>) newContext;
