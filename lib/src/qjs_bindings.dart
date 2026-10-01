@@ -67,6 +67,10 @@ class QjsBridge {
   QjsBridge._(this._lib) {
     Pointer<T> _lk<T extends NativeType>(String n) => _lib.lookup<T>(n);
 
+    updateStackTop =
+        _lk<NativeFunction<Void Function(Pointer<Void>)>>(
+            'qjs_update_stack_top')
+        .asFunction();
     newRuntime =
         _lk<NativeFunction<Pointer<Void> Function()>>('qjs_new_runtime')
             .asFunction();
@@ -386,6 +390,7 @@ class QjsBridge {
 
   final DynamicLibrary _lib;
 
+  late final void Function(Pointer<Void>) updateStackTop;
   late final Pointer<Void> Function() newRuntime;
   late final void Function(Pointer<Void>) freeRuntime;
   late final Pointer<Void> Function(Pointer<Void>) newContext;

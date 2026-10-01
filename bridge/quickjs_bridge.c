@@ -264,6 +264,17 @@ QJS_API int32_t qjs_poll_rejection(JSRuntime *rt, char **out,
   return 1;
 }
 
+/* 栈基线刷新（DsPlayer 补丁，isolate 线程迁移 2026-09-30）：quickjs 的栈
+ * 检查基线 stack_top 在引擎创建线程记录，而 Dart isolate 会迁移 OS 线程——
+ * 迁移后求值线程的栈位置与基线差随机超过许可线 → 假 stack overflow
+ * （drpy3 worker isolate 真机实锤：512MB 许可仍炸，md5 级浅调用即触发）。
+ * 宿主在每次进入引擎求值前调用本函数，以当前线程重算基线。
+ * quickjs-ng 原生 API（quickjs.h JS_UpdateStackTop）。 */
+QJS_API void qjs_update_stack_top(void *rt_ptr) {
+  JSRuntime *rt = (JSRuntime *)rt_ptr;
+  if (rt) JS_UpdateStackTop(rt);
+}
+
 QJS_API JSRuntime *qjs_new_runtime(void) { return JS_NewRuntime(); }
 
 QJS_API void qjs_free_runtime(JSRuntime *rt) {

@@ -74,4 +74,5 @@ qjs_settle_pending
 qjs_stringify
 qjs_throw_error
 qjs_to_cstring
+qjs_update_stack_top
 qjs_value_move

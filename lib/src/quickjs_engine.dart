@@ -766,6 +766,13 @@ class QuickjsEngine implements JsEngine {
   }
 
   Future<T> _runGuardedAsync<T>(Future<T> Function() body) async {
+    // 栈基线刷新（isolate 线程迁移，2026-09-30）：所有执行链的汇聚点——
+    // Dart isolate 会迁移 OS 线程，quickjs 栈检查基线（创建线程记录的
+    // stack_top）与迁移后求值线程的栈地址差随机超过许可线 → 假 stack
+    // overflow（512MB 许可仍炸，drpy3 worker isolate 真机实锤，md5 级
+    // 浅调用即触发）。每入口以当前线程重算基线，彻底根治；顺带根治
+    // dr2（qjs_worker）的偶发假爆栈。开销 = 一次取址，纳秒级。
+    _bridge.updateStackTop(_rt);
     final timeout = _config.timeoutMs;
     final useDeadline = timeout != null && timeout > 0;
     if (useDeadline) {
