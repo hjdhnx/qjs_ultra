@@ -435,6 +435,10 @@ class QuickjsEngine implements JsEngine {
   /// 同步调用 JS 函数，返回**结果槽**（调用方负责 freeValue/freeSlot）。
   /// rc != 0 时抛结构化异常。供 [_callSlot] / [_callSlotAsync] 复用。
   Pointer<QjsValue> _callRaw(Pointer<QjsValue> funcSlot, List<Object?> args) {
+    // 每次进 FFI 执行 JS 前刷新栈基线（比 _runGuardedAsync 入口更细：
+    // await 恢复后 isolate 可能已迁移到另一 OS 线程，入口级刷新覆盖不到
+    // 续跑段——drpy3 worker 真机 stack overflow 随机残留的根因）
+    _bridge.updateStackTop(_rt);
     final argv = calloc<QjsValue>(args.isEmpty ? 1 : args.length);
     var out = Pointer<QjsValue>.fromAddress(0);
     try {
@@ -759,6 +763,7 @@ class QuickjsEngine implements JsEngine {
   /// 前台泵：job 异常抛给当前调用方（与 [_pumpUntilIdle] 的差异点）。
   void _pumpForeground() {
     for (;;) {
+      _bridge.updateStackTop(_rt); // job 可能由迁移后的线程续跑（同上）
       final rc = _bridge.executePendingJob(_rt);
       if (rc == 0) return;
       if (rc < 0) throw _takeException();
