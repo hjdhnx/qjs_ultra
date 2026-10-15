@@ -124,7 +124,7 @@ caught + ':' + passed
       final N = 8;
       final results = await Future.wait([
         for (var i = 0; i < N; i++)
-          Isolate.run(() => _concurrentWorker(libPath!, i)),
+          Isolate.run(() => _concurrentWorker(libPath, i)),
       ]);
       expect(results.every((e) => e == 'done'), isTrue);
     });
