@@ -321,15 +321,25 @@ class QuickjsEngine implements JsEngine {
         if (args.length >= 2) {
           final level = args[0]?.toString() ?? 'log';
           final message = args[1]?.toString() ?? '';
+          // console 是日志面：sink 实现方抛出的任何异常就地吞掉——
+          // 吞不掉会把异常沿 hostCall 的 exception 返回值炸掉 JS 的
+          // console.log 调用点（源脚本普遍不 catch console），日志缺陷
+          // 不应该升级成整次求值失败（2026-10-15 unwind 排查配套加固）
+          void emit(String line) {
+            try {
+              _consoleSink?.call(line);
+            } catch (_) {}
+          }
+
           switch (level) {
             case 'info':
-              _consoleSink?.call('[info] $message');
+              emit('[info] $message');
             case 'warn':
-              _consoleSink?.call('[warn] $message');
+              emit('[warn] $message');
             case 'error':
-              _consoleSink?.call('[error] $message');
+              emit('[error] $message');
             default: // log / debug 及未知等级一律走 log
-              _consoleSink?.call('[log] $message');
+              emit('[log] $message');
           }
         }
         return null;
