@@ -873,30 +873,19 @@ class QuickjsEngine implements JsEngine {
     }
   }
 
-  /// drpy3 bundle 装载前置垫片：globalThis.fjs 桥（bundle **原样复用，
-  /// 零改包**）、atob/btoa 兜底、timers。[bridge] 收到 bundle 发来的
-  /// `{action, ...}` 消息（req/loadAsset/getProxy/evalModule 协议与
-  /// DsPlayer Drpy3BridgeHandlers 完全一致）。须在装载 bundle 之前调用。
+  /// drpy3 bundle 装载前置垫片：bundle 的桥表（bundle **原样复用，零改包**，
+  /// 其桥表名恰好叫 `globalThis.fjs`，与已弃用的 fjs 引擎无关）、timers。
+  /// [bridge] 收到 bundle 发来的 `{action, ...}` 消息（req/loadAsset/getProxy/
+  /// evalModule 协议与 DsPlayer Drpy3BridgeHandlers 完全一致）。须在装载
+  /// bundle 之前调用。
+  ///
+  /// atob/btoa 由引擎原生注入（quickjs.c 的 JS_AddIntrinsicAToB 随
+  /// JS_NewContext 无条件注册），不需要 JS 兜底。
   void installDrpy3Shim(Future<Object?> Function(Object? message) bridge) {
     registerAsyncFunction('__qjs_bridge_call', (args) => bridge(args.first));
     installTimers();
     evaluate('''
 globalThis.fjs = { bridge_call: (msg) => globalThis.__qjs_bridge_call(msg) };
-if (typeof globalThis.atob === 'undefined') {
-  globalThis.atob = (s) => {
-    const bytes = [];
-    for (let i = 0; i < s.length; i++) bytes.push(s.charCodeAt(i) & 0xff);
-    return Buffer.from(bytes).toString('base64');
-  };
-}
-if (typeof globalThis.btoa === 'undefined') {
-  globalThis.btoa = (s) => {
-    const bin = Buffer.from(String(s), 'base64');
-    let out = '';
-    for (let i = 0; i < bin.length; i++) out += String.fromCharCode(bin[i]);
-    return out;
-  };
-}
 // setImmediate/clearImmediate：emscripten 胶水的 nextTick 探测/直接引用需要
 // （央视频 _lib.cctv.worker.new.js 执行即报 "'setImmediate' is not defined"，
 // 2026-09-28 实锤）。引擎只有 setTimeout 系，用 0ms 等价模拟。
