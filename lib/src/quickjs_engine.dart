@@ -174,9 +174,17 @@ class QuickjsEngine implements JsEngine {
         }
       });
 
-  /// 单次 JS 执行的墙钟截止期（fjs shutdown 模型的同步宿主适配版）：
+  /// 单次同步 JS 执行段的墙钟截止期（fjs shutdown 模型的同步宿主适配版）：
   /// Dart 侧 Timer 在同步 eval 期间不会触发，超时必须由 C 侧中断处理器
-  /// 查墙钟。离开作用域即清除，一次调用超时不影响后续调用。
+  /// 查墙钟。离开作用域即清除。
+  ///
+  /// 2026-10-26（L2）语义收敛：deadline 的粒度是**同步执行段**而不是
+  /// 一次顶层调用。旧实现把它挂在 `_runGuardedAsync` 的 async body 上，
+  /// body 在 `await _waitForActivity()` 挂起期间 deadline 保持激活——
+  /// 到期后会打断**其他调用方**正在执行的 JS；并发调用方还互相覆盖/
+  /// 提前清除（B 退出清掉 A 的截止期，A 失去保护；A 的到期截止期
+  /// 打断无辜的 B）。收敛后「单段同步 JS ≤ timeoutMs」，整条异步链
+  /// 的墙钟交还给宿主（DaoBox 解析预算等由 await 的组织方控制）。
   T _runGuarded<T>(T Function() body) {
     final timeout = _config.timeoutMs;
     final useDeadline = timeout != null && timeout > 0;
@@ -451,36 +459,39 @@ class QuickjsEngine implements JsEngine {
     // 旧 so 无此导出时 updateStackTop 为 null（降级不刷新）。
     final refresh = _bridge.updateStackTop;
     if (refresh != null) refresh(_rt);
-    final argv = calloc<QjsValue>(args.isEmpty ? 1 : args.length);
-    var out = Pointer<QjsValue>.fromAddress(0);
-    try {
-      for (var i = 0; i < args.length; i++) {
-        _dartToJs(args[i], argv + i);
-      }
-      out = _newSlot();
-      final rc = _bridge.call(
-        _ctxPointer,
-        funcSlot,
-        nullptr,
-        args.length,
-        argv,
-        out,
-      );
-      if (rc != 0) {
-        _bridge.freeSlot(out);
+    // 同步 JS 执行段自带截止期（L2 修复，语义见 _runGuarded 注释）
+    return _runGuarded(() {
+      final argv = calloc<QjsValue>(args.isEmpty ? 1 : args.length);
+      var out = Pointer<QjsValue>.fromAddress(0);
+      try {
+        for (var i = 0; i < args.length; i++) {
+          _dartToJs(args[i], argv + i);
+        }
+        out = _newSlot();
+        final rc = _bridge.call(
+          _ctxPointer,
+          funcSlot,
+          nullptr,
+          args.length,
+          argv,
+          out,
+        );
+        if (rc != 0) {
+          _bridge.freeSlot(out);
+          out = Pointer<QjsValue>.fromAddress(0);
+          throw _takeException();
+        }
+        final result = out;
         out = Pointer<QjsValue>.fromAddress(0);
-        throw _takeException();
+        return result;
+      } finally {
+        if (out.address != 0) _bridge.freeSlot(out);
+        for (var i = 0; i < args.length; i++) {
+          _bridge.freeValue(_ctxPointer, argv + i);
+        }
+        malloc.free(argv);
       }
-      final result = out;
-      out = Pointer<QjsValue>.fromAddress(0);
-      return result;
-    } finally {
-      if (out.address != 0) _bridge.freeSlot(out);
-      for (var i = 0; i < args.length; i++) {
-        _bridge.freeValue(_ctxPointer, argv + i);
-      }
-      malloc.free(argv);
-    }
+    });
   }
 
   Object? _callSlot(Pointer<QjsValue> funcSlot, List<Object?> args) =>
@@ -560,11 +571,13 @@ class QuickjsEngine implements JsEngine {
   /// 排空微任务队列。job 内抛出的 JS 异常不能吞掉，
   /// 否则模块顶层求值失败会表现为"静默不执行"。
   void _drainJobs() {
-    for (;;) {
-      final rc = _bridge.executePendingJob(_rt);
-      if (rc == 0) return;
-      if (rc < 0) throw _takeException();
-    }
+    _runGuarded(() {
+      for (;;) {
+        final rc = _bridge.executePendingJob(_rt);
+        if (rc == 0) return;
+        if (rc < 0) throw _takeException();
+      }
+    });
   }
 
   /// 排空后台未处理 promise rejection 队列（fjs drainUnhandledJobErrors
@@ -608,6 +621,30 @@ class QuickjsEngine implements JsEngine {
   var _nextTimerId = 1;
   final _timers = <int, Timer>{};
 
+  /// 前台调用串行化闸门（L2 修复，2026-10-26）。
+  ///
+  /// callAsync/evaluateAsync 的前台泵（`_resolveResultAsync` 的
+  /// 「泵微任务 → 查 promise 态 → 等 in-flight」循环）共享同一个
+  /// job 队列与 in-flight 集合：泵不区分 job 归属（A 会把 B 的链推进）、
+  /// job 异常归属错乱、唤醒信号跨等待者共享。多前台泵交错的窗口是
+  /// DaoBox L2（webview 会话活跃时异步链偶发不落定，引擎事件全停）
+  /// 的复现条件。串行化后同一时刻只有一个前台泵在循环里，其余调用
+  /// 排队——settle 段（`_runAsyncBridge`）不经此闸门，await 链照常
+  /// 推进；单个调用挂死只堵队列（与串行语义一致），不再把并发窗口
+  /// 放大成全局态污染。
+  Future<void>? _foregroundGate;
+
+  Future<T> _serialized<T>(Future<T> Function() body) {
+    final prev = _foregroundGate ?? Future<void>.value();
+    final c = Completer<void>();
+    _foregroundGate = c.future;
+    // prev 吞异常（前一个调用失败不能断闸门链）
+    return prev
+        .catchError((_) {})
+        .then((_) => body())
+        .whenComplete(c.complete);
+  }
+
   /// 注册异步宿主函数为 JS 全局函数。返回值走 JSON-like 契约
   /// （Map/List/String/num/bool/null/Uint8List/DateTime）。
   void registerAsyncFunction(
@@ -649,12 +686,18 @@ class QuickjsEngine implements JsEngine {
         // 表已清（engine 已 dispose）：引用自释放，静默收场
         _bridge.freeValue(_ctxPointer, value);
       }
+    } catch (e) {
+      // settle 段自身抛出的异常（FFI 层错误）就地吞掉：**绝不能让它跳过
+      // finally 里的 in-flight 清理**——pid 残留会让所有前台泵判定
+      // 「还有活动在途」而永久挂起（DaoBox L2「引擎事件全停」的形状）。
+      _backgroundErrors.add('bridge: $e');
     } finally {
       _bridge.freeSlot(value);
+      _pumpUntilIdle(); // settle 后泵微任务，推进 JS await 链
+      _asyncInFlight.remove(pid);
+      _signalActivity();
     }
-    _pumpUntilIdle(); // settle 后泵微任务，推进 JS await 链
-    _asyncInFlight.remove(pid);
-    _signalActivity();  }
+  }
 
   /// 后台泵：job 异常吞进 [drainBackgroundErrors]（无前台调用方可抛）。
   /// 重入保护：泵中触发的新 job 由外层循环继续消费（单 isolate 无并发）。
@@ -662,17 +705,19 @@ class QuickjsEngine implements JsEngine {
     if (_pumping) return;
     _pumping = true;
     try {
-      for (;;) {
-        // 栈基线刷新（isolate 线程迁移）：本泵是异步桥的续跑主通道
-        // （bridge settle 后推进 JS await 链）——settle 可能发生在迁移后
-        // 的线程，旧基线在新线程上随机误判 stack overflow（drpy3 worker
-        // 真机实锤，home/category 随机红）。每轮以当前线程重算。
-        final refresh = _bridge.updateStackTop;
-        if (refresh != null) refresh(_rt);
-        final rc = _bridge.executePendingJob(_rt);
-        if (rc == 0) return;
-        if (rc < 0) _backgroundErrors.add(_takeException().toString());
-      }
+      _runGuarded(() {
+        for (;;) {
+          // 栈基线刷新（isolate 线程迁移）：本泵是异步桥的续跑主通道
+          // （bridge settle 后推进 JS await 链）——settle 可能发生在迁移后
+          // 的线程，旧基线在新线程上随机误判 stack overflow（drpy3 worker
+          // 真机实锤，home/category 随机红）。每轮以当前线程重算。
+          final refresh = _bridge.updateStackTop;
+          if (refresh != null) refresh(_rt);
+          final rc = _bridge.executePendingJob(_rt);
+          if (rc == 0) return;
+          if (rc < 0) _backgroundErrors.add(_takeException().toString());
+        }
+      });
     } finally {
       _pumping = false;
     }
@@ -690,16 +735,17 @@ class QuickjsEngine implements JsEngine {
   /// 异步求值（fjs 前台等待语义）：结果为 promise 时泵微任务并等待
   /// in-flight 异步宿主调用直至 settle；rejected 抛 [JsEvalException]。
   /// 队空仍 pending（等的是未注册的异步源）返回 null。
+  /// 经 [_serialized] 闸门串行（多前台泵交错的窗口收敛，见其注释）。
   Future<Object?> evaluateAsync(String script,
       {String? fileName, int flags = QjsEvalFlags.global}) {
     _checkDisposed();
-    return _runGuardedAsync(() async {
+    return _serialized(() => _runGuardedAsync(() async {
       final scriptPtr = script.toNativeUtf8();
       final namePtr = (fileName ?? 'script.js').toNativeUtf8();
       final out = _newSlot();
       try {
-        final rc = _bridge.eval(
-            _ctxPointer, scriptPtr, _utf8Len(script), namePtr, flags, out);
+        final rc = _runGuarded(() => _bridge.eval(
+            _ctxPointer, scriptPtr, _utf8Len(script), namePtr, flags, out));
         if (rc != 0) throw _takeException();
         final result = await _resolveResultAsync(out);
         _pumpUntilIdle();
@@ -711,32 +757,33 @@ class QuickjsEngine implements JsEngine {
           ..free(scriptPtr)
           ..free(namePtr);
       }
-    });
+    }));
   }
 
   /// 异步调用 JS 函数（[callFunction] 的 async 版，promise 语义同
   /// [evaluateAsync]）。drpy3 六环节调度入口。
+  /// 经 [_serialized] 闸门串行（多前台泵交错的窗口收敛，见其注释）。
   Future<Object?> callAsync(Object? fn, List<Object?> args) {
     _checkDisposed();
-    return _runGuardedAsync(() async {
-      switch (fn) {
-        case JsFunctionRef ref:
-          return _callSlotAsync(ref.slot, args);
-        case String name:
-          final target = getGlobalProperty(name);
-          if (target is JsFunctionRef) {
-            try {
-              return await _callSlotAsync(target.slot, args);
-            } finally {
-              target.close();
-              _openFunctionRefs.remove(target);
-            }
+    return _serialized(() => _runGuardedAsync(() async {
+          switch (fn) {
+            case JsFunctionRef ref:
+              return _callSlotAsync(ref.slot, args);
+            case String name:
+              final target = getGlobalProperty(name);
+              if (target is JsFunctionRef) {
+                try {
+                  return await _callSlotAsync(target.slot, args);
+                } finally {
+                  target.close();
+                  _openFunctionRefs.remove(target);
+                }
+              }
+              throw StateError('全局属性 $name 不是函数');
+            default:
+              throw StateError('callAsync 只接受 JsFunctionRef 或全局函数名');
           }
-          throw StateError('全局属性 $name 不是函数');
-        default:
-          throw StateError('callAsync 只接受 JsFunctionRef 或全局函数名');
-      }
-    });
+        }));
   }
 
   Future<Object?> _callSlotAsync(
@@ -780,13 +827,15 @@ class QuickjsEngine implements JsEngine {
 
   /// 前台泵：job 异常抛给当前调用方（与 [_pumpUntilIdle] 的差异点）。
   void _pumpForeground() {
-    for (;;) {
-      final refresh = _bridge.updateStackTop;
-      if (refresh != null) refresh(_rt); // job 可能由迁移后的线程续跑（同上）
-      final rc = _bridge.executePendingJob(_rt);
-      if (rc == 0) return;
-      if (rc < 0) throw _takeException();
-    }
+    _runGuarded(() {
+      for (;;) {
+        final refresh = _bridge.updateStackTop;
+        if (refresh != null) refresh(_rt); // job 可能由迁移后的线程续跑（同上）
+        final rc = _bridge.executePendingJob(_rt);
+        if (rc == 0) return;
+        if (rc < 0) throw _takeException();
+      }
+    });
   }
 
   Future<T> _runGuardedAsync<T>(Future<T> Function() body) async {
@@ -800,21 +849,11 @@ class QuickjsEngine implements JsEngine {
     // hasStackTopRefresh 探测并提示升级插件。
     final refresh = _bridge.updateStackTop;
     if (refresh != null) refresh(_rt);
-    final timeout = _config.timeoutMs;
-    final useDeadline = timeout != null && timeout > 0;
-    if (useDeadline) {
-      _deadlineActive = true;
-      _bridge.setDeadline(
-          _rt, DateTime.now().millisecondsSinceEpoch + timeout);
-    }
-    try {
-      return await body();
-    } finally {
-      if (useDeadline) {
-        _deadlineActive = false;
-        _bridge.setDeadline(_rt, 0);
-      }
-    }
+    // deadline 不在这里设置（L2 修复，2026-10-26）：async body 会因
+    // await _waitForActivity 挂起任意久，挂起期间保持截止期会打断其他
+    // 调用方的同步 JS 段，并发调用方还会互相覆盖/提前清除。各同步
+    // 执行点（eval/call/泵循环）经 _runGuarded 自带截止期。
+    return await body();
   }
 
   /// so 是否支持栈基线刷新（qjs_update_stack_top，so 1.0.5+）。
