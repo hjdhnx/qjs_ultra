@@ -431,6 +431,66 @@ group('cheerio :gt/:lt 切片（jQuery 语义）', () {
           ' return \$("li").gt(-2).text(); })()'),
       'd', reason: 'gt(-2) → 最后一个');
   });
+
+  test('临时 \$ 链式调用不崩溃（文档对象引用计数）', () {
+    // 不把 cheerio.load() 的返回值存变量：$ 被 GC 后集合仍持有文档引用，
+    // 修复前这里会访问已释放的 Lexbor DOM（旧 DLL 必然崩溃）。
+    final v = engine.evaluate(
+        '(() => cheerio.load(${jsonEncode(html)})("li").gt(-2).text())()');
+    expect(v, 'd');
+    engine.runGC();
+  });
+});
+
+group('文档能力对齐', () {
+  late QuickjsEngine engine;
+  setUp(() {
+    engine = QuickjsEngine.createWith(const JsEngineConfig(), libPath: libPath);
+    engine.installTimers();
+  });
+  tearDown(() => engine.dispose());
+
+  test('queueMicrotask 在微任务队列执行', () async {
+    final v = await engine
+        .evaluateAsync('new Promise((r) => queueMicrotask(() => r(42)))');
+    expect(v, 42);
+    expect(engine.evaluate('typeof setInterval'), 'function');
+    expect(engine.evaluate('typeof clearInterval'), 'function');
+  });
+
+  test('setInterval 周期回调 + clearInterval 停止', () async {
+    engine.evaluate('globalThis.__ticks = 0;'
+        'globalThis.__iv = setInterval(() => { globalThis.__ticks++; }, 5);');
+    await Future<void>.delayed(const Duration(milliseconds: 60));
+    final ticks =
+        engine.evaluate('clearInterval(globalThis.__iv); globalThis.__ticks');
+    expect(ticks, greaterThanOrEqualTo(2));
+  });
+
+  test('import.meta.url 指向模块名', () async {
+    engine.registerModule(
+        'meta_probe', 'globalThis.__meta_url = import.meta.url;');
+    await engine.evaluateAsync('import("meta_probe")');
+    expect(engine.evaluate('globalThis.__meta_url'), contains('meta_probe'));
+  });
+
+  test('DataBase Statement bind/get/iterate', () {
+    final v = engine.evaluate(r'''
+(() => {
+  const db = new DataBase(':memory:');
+  db.exec("create table t(a integer, b text); insert into t values (1, 'x'), (2, 'y')");
+  const bound = db.prepare('select a from t where a >= ? order by a').bind(1).get();
+  const direct = db.prepare('select b from t where a = ?').get(2).b;
+  const it = db.prepare('select a from t order by a').iterate();
+  const first = it.next().value;
+  db.close();
+  return {bound: bound.a, direct: direct, iter: first.a};
+})()
+''') as Map;
+    expect(v['bound'], 1);
+    expect(v['direct'], 'y');
+    expect(v['iter'], 1);
+  });
 });
 }
 

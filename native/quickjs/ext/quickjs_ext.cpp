@@ -33,12 +33,24 @@ void qjs_ext_set_data(JSRuntime *rt, void *p);
 } /* extern "C" */
 
 /* JS 层封装库注入（与原 loadExtendLibraries 一致） */
+/* 全局补充垫片：queueMicrotask 是浏览器/Node 的标准 API，QuickJS 内核不提供。
+ * Promise.then 的回调即微任务；回调抛错进未处理 rejection 管道（宿主可诊断）。 */
+static const char *QJS_GLOBALS_SHIM =
+    "if (typeof globalThis.queueMicrotask === 'undefined') {"
+    "  globalThis.queueMicrotask = function (fn) {"
+    "    if (typeof fn !== 'function')"
+    "      throw new TypeError('queueMicrotask expects a function');"
+    "    Promise.resolve().then(function () { fn(); });"
+    "  };"
+    "}";
+
 static void qjs_ext_load_js_libraries(JSContext *ctx)
 {
     JS_FreeValue(ctx, JS_Eval(ctx, DATE_POLYFILL, strlen(DATE_POLYFILL), "date-polyfill.js", JS_EVAL_TYPE_GLOBAL));
     JS_FreeValue(ctx, JS_Eval(ctx, CONSOLE, strlen(CONSOLE), "console.js", JS_EVAL_TYPE_GLOBAL));
     JS_FreeValue(ctx, JS_Eval(ctx, WASM, strlen(WASM), "wasm.js", JS_EVAL_TYPE_GLOBAL));
     JS_FreeValue(ctx, JS_Eval(ctx, SQLITE, strlen(SQLITE), "sqlite3.js", JS_EVAL_TYPE_GLOBAL));
+    JS_FreeValue(ctx, JS_Eval(ctx, QJS_GLOBALS_SHIM, strlen(QJS_GLOBALS_SHIM), "globals-shim.js", JS_EVAL_TYPE_GLOBAL));
 }
 
 /*

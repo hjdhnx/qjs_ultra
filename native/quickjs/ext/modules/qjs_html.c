@@ -29,6 +29,7 @@ typedef struct {
     lxb_css_parser_t      *css_parser;
     lxb_selectors_t       *selectors;
     qjs_idx_t             *idx;       /* id/class/tag hash index for fast queries */
+    int                    refcount;  /* CheerioDoc 对象 + 所有存活 Cheerio 集合 */
 } qjs_cheeriodoc_t;
 
 
@@ -287,10 +288,13 @@ static JSValue qjs_cheerio_from_selector(JSContext *ctx,
 /* CheerioDoc                                                          */
 /* ------------------------------------------------------------------ */
 
-static void qjs_doc_finalizer(JSRuntime *rt, JSValue val)
+/* 释放一个 doc 引用；归零才真正销毁。
+ * 引用来源：CheerioDoc 对象 1 个 + 每个 Cheerio 集合 1 个。
+ * 这样临时 `cheerio.load(html)(...)` 的 $ 函数被 GC 后，只要集合还活着，
+ * 文档（Lexbor DOM / CSS parser）就不会提前释放。 */
+static void qjs_doc_unref(JSRuntime *rt, qjs_cheeriodoc_t *doc)
 {
-    qjs_cheeriodoc_t *doc = JS_GetOpaque(val, QJS_CORE_CLASS_ID_CHEERIO_DOC);
-    if (!doc) return;
+    if (!doc || --doc->refcount > 0) return;
     if (doc->idx) qjs_index_destroy(doc->idx);
     if (doc->selectors) lxb_selectors_destroy(doc->selectors, true);
     if (doc->css_parser) {
@@ -301,6 +305,13 @@ static void qjs_doc_finalizer(JSRuntime *rt, JSValue val)
     }
     if (doc->document) lxb_html_document_destroy(doc->document);
     js_free_rt(rt, doc);
+}
+
+static void qjs_doc_finalizer(JSRuntime *rt, JSValue val)
+{
+    qjs_cheeriodoc_t *doc = JS_GetOpaque(val, QJS_CORE_CLASS_ID_CHEERIO_DOC);
+    if (!doc) return;
+    qjs_doc_unref(rt, doc);
 }
 
 /* The $ function body: $(selector) or $(html) or $(cheerio)
@@ -625,6 +636,7 @@ static JSValue qjs_cheerio_load(JSContext *ctx, JSValueConst this_val,
         if (allocated) JS_FreeCString(ctx, html);
         return JS_EXCEPTION;
     }
+    doc->refcount = 1; /* owned by the CheerioDoc object below */
 
     doc->document = lxb_html_document_create();
     if (!doc->document) {
@@ -703,6 +715,7 @@ static void qjs_cheerio_finalizer(JSRuntime *rt, JSValue val)
     if (!ch) return;
     JS_FreeValueRT(rt, ch->prev);
     if (ch->nodes) js_free_rt(rt, ch->nodes);
+    if (ch->doc) qjs_doc_unref(rt, ch->doc);
     js_free_rt(rt, ch);
 }
 
@@ -731,6 +744,7 @@ static JSValue qjs_cheerio_wrap(JSContext *ctx, qjs_cheeriodoc_t *doc,
     JS_SetOpaque(obj, ch);
     /* Set length as a regular property */
     JS_SetPropertyStr(ctx, obj, "length", JS_NewInt32(ctx, (int32_t)count));
+    doc->refcount++; /* collection keeps the document alive */
     return obj;
 }
 

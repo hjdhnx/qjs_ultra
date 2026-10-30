@@ -31788,12 +31788,48 @@ JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
     /* allocate meta_obj only if requested to save memory */
     obj = m->meta_obj;
     if (JS_IsUndefined(obj)) {
+        JSValue url;
+        const char *name = NULL;
         obj = JS_NewObjectProto(ctx, JS_NULL);
         if (JS_IsException(obj))
             return JS_EXCEPTION;
         m->meta_obj = obj;
+
+        /* import.meta.url：本引擎的模块是虚拟模块，url 即注册名；
+         * 与 QuickJS CLI 一致，名字不含 ':' 时补 file:// 前缀。 */
+        if (m->module_name == JS_ATOM_NULL) {
+            url = JS_NewString(ctx, "");
+        } else {
+            name = JS_AtomToCString(ctx, m->module_name);
+            if (!name)
+                goto fail;
+            if (strchr(name, ':')) {
+                url = JS_NewString(ctx, name);
+            } else {
+                size_t n = strlen(name);
+                char *buf = js_malloc(ctx, n + 8);
+                if (!buf) {
+                    url = JS_EXCEPTION;
+                } else {
+                    memcpy(buf, "file://", 7);
+                    memcpy(buf + 7, name, n + 1);
+                    url = JS_NewString(ctx, buf);
+                    js_free(ctx, buf);
+                }
+            }
+            JS_FreeCString(ctx, name);
+        }
+        if (JS_IsException(url))
+            goto fail;
+        JS_DefinePropertyValueStr(ctx, obj, "url", url, JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "main", JS_NewBool(ctx, FALSE),
+                                  JS_PROP_C_W_E);
     }
     return JS_DupValue(ctx, obj);
+fail:
+    JS_FreeValue(ctx, obj);
+    m->meta_obj = JS_UNDEFINED;
+    return JS_EXCEPTION;
 }
 
 static JSValue js_import_meta(JSContext *ctx)

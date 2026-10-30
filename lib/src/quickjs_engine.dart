@@ -620,6 +620,7 @@ class QuickjsEngine implements JsEngine {
   bool _pumping = false;
   var _nextTimerId = 1;
   final _timers = <int, Timer>{};
+  final _intervals = <int, Timer>{};
 
   /// 前台调用串行化闸门（L2 修复，2026-10-26）。
   ///
@@ -868,11 +869,11 @@ class QuickjsEngine implements JsEngine {
     return out;
   }
 
-  /// 安装 setTimeout/clearTimeout 宿主实现（Dart Timer 驱动）。回调经
-  /// [callAsync] 执行：回调内 await 异步宿主函数可正常驱动；回调异常进
-  /// 后台错误（guarded timers 语义）。未触发的 Timer 计入
-  /// in-flight 活动集——evaluateAsync/callAsync 的前台泵会等它，而不是
-  /// 队空提前放弃。setInterval 未提供（drpy3 bundle 无引用；需要时再加）。
+  /// 安装 setTimeout/clearTimeout/setInterval/clearInterval 宿主实现
+  /// （Dart Timer 驱动）。回调经 [callAsync] 执行：回调内 await 异步宿主函数
+  /// 可正常驱动；回调异常进后台错误（guarded timers 语义）。未触发的 Timer
+  /// 计入 in-flight 活动集——evaluateAsync/callAsync 的前台泵会等它，而不是
+  /// 队空提前放弃；setInterval 在 clearInterval 前持续计入活动。
   void installTimers() {
     registerFunction('__qjs_setTimeout', (args) {
       final fn = args.isNotEmpty ? args[0] : null;
@@ -895,10 +896,42 @@ class QuickjsEngine implements JsEngine {
       }
       return null;
     });
+    registerFunction('__qjs_setInterval', (args) {
+      final fn = args.isNotEmpty ? args[0] : null;
+      final ms = args.length > 1 ? (args[1] as num?)?.toInt() ?? 0 : 0;
+      if (fn is! JsFunctionRef) return 0;
+      final id = _nextTimerId++;
+      _asyncInFlight.add(-id);
+      _intervals[id] =
+          Timer.periodic(Duration(milliseconds: ms), (_) {
+        unawaited(_fireInterval(fn, id));
+      });
+      return id;
+    });
+    registerFunction('__qjs_clearInterval', (args) {
+      final id = args.isNotEmpty ? (args[0] as num?)?.toInt() : null;
+      final t = id == null ? null : _intervals.remove(id);
+      if (t != null) {
+        t.cancel();
+        if (_asyncInFlight.remove(-id!)) _signalActivity();
+      }
+      return null;
+    });
     evaluate(
       'globalThis.setTimeout = (fn, ms) => __qjs_setTimeout(fn, ms ?? 0);'
-      'globalThis.clearTimeout = (id) => __qjs_clearTimeout(id);',
+      'globalThis.clearTimeout = (id) => __qjs_clearTimeout(id);'
+      'globalThis.setInterval = (fn, ms) => __qjs_setInterval(fn, ms ?? 0);'
+      'globalThis.clearInterval = (id) => __qjs_clearInterval(id);',
     );
+  }
+
+  /// setInterval 单次回调：异常进后台错误，不打断后续周期。
+  Future<void> _fireInterval(JsFunctionRef fn, int id) async {
+    try {
+      await callAsync(fn, const []);
+    } catch (e) {
+      _backgroundErrors.add('interval: $e');
+    }
   }
 
   Future<void> _fireTimer(JsFunctionRef fn, int key) async {
@@ -1007,6 +1040,14 @@ if (typeof globalThis.setImmediate === 'undefined') {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    for (final t in _timers.values) {
+      t.cancel();
+    }
+    _timers.clear();
+    for (final t in _intervals.values) {
+      t.cancel();
+    }
+    _intervals.clear();
     for (final ref in List<JsFunctionRef>.of(_openFunctionRefs)) {
       ref.close();
     }
