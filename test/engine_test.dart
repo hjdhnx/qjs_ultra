@@ -36,6 +36,9 @@ void main() {
     return;
   }
 
+  // 可选插件探测：JSON5 是否随本 so 编译进来（-DQJS_ENABLE_JSON5=ON）。
+  final json5Available = _hasGlobal(libPath, 'JSON5');
+
   late QuickjsEngine engine;
 
   setUp(() {
@@ -502,6 +505,97 @@ new Promise((resolve) => {
     expect(v['iter'], 1);
   });
 });
+
+group('JSON5 插件（可选全局能力）', () {
+  late QuickjsEngine engine;
+  setUp(() {
+    engine = QuickjsEngine.createWith(const JsEngineConfig(), libPath: libPath);
+  });
+  tearDown(() => engine.dispose());
+
+  test('JSON5.parse：注释/裸键/单引号/尾逗号/十六进制/Infinity/续行', () {
+    final v = engine.evaluate(r'''
+JSON5.parse(`
+// line comment
+{
+  unquoted: 'single',
+  "quoted": "double",
+  /* block comment */
+  hex: 0xdecaf,
+  leadingDot: .5,
+  trailingDot: 5.,
+  signed: +3,
+  inf: Infinity,
+  nan: NaN,
+  trailing: [1, 2, 3,],
+  nested: {a: [true, null, false],},
+  multiline: 'line1\
+line2',
+  escaped: '\x41\u4e2d',
+}
+`)
+''') as Map;
+    expect(v['unquoted'], 'single');
+    expect(v['quoted'], 'double');
+    expect(v['hex'], 912559);
+    expect(v['leadingDot'], 0.5);
+    expect(v['trailingDot'], 5);
+    expect(v['signed'], 3);
+    expect(v['inf'], double.infinity);
+    expect((v['nan'] as num).isNaN, isTrue);
+    expect((v['trailing'] as List).length, 3);
+    expect(((v['nested'] as Map)['a'] as List).length, 3);
+    expect(v['multiline'], 'line1line2');
+    expect(v['escaped'], 'A中');
+  }, skip: json5Available ? null : 'so 未启用 QJS_ENABLE_JSON5（编译期开关）');
+
+  test('JSON5.stringify 输出可被 JSON.parse 回读', () {
+    final s = engine.evaluate(
+        'JSON5.stringify({a: 1, b: [true, null], c: "x"})') as String;
+    final back = engine.evaluate('JSON.parse(${jsonEncode(s)})') as Map;
+    expect(back['a'], 1);
+    expect(back['b'], [true, null]);
+    expect(back['c'], 'x');
+  }, skip: json5Available ? null : 'so 未启用 QJS_ENABLE_JSON5（编译期开关）');
+
+  test('__proto__ 作为普通自有属性，不污染原型', () {
+    final v = engine.evaluate(r'''
+(() => {
+  const o = JSON5.parse('{"__proto__": {"polluted": 1}}');
+  return {
+    own: Object.prototype.hasOwnProperty.call(o, '__proto__'),
+    val: o.__proto__.polluted,
+    clean: Object.getPrototypeOf(o) === Object.prototype,
+    globalClean: ({}).polluted === undefined,
+  };
+})()
+''') as Map;
+    expect(v['own'], isTrue);
+    expect(v['val'], 1);
+    expect(v['clean'], isTrue);
+    expect(v['globalClean'], isTrue);
+  }, skip: json5Available ? null : 'so 未启用 QJS_ENABLE_JSON5（编译期开关）');
+
+  test('非法输入抛 SyntaxError', () {
+    expect(
+      () => engine.evaluate("JSON5.parse('{a:}')"),
+      throwsA(isA<JsEvalException>()),
+    );
+  }, skip: json5Available ? null : 'so 未启用 QJS_ENABLE_JSON5（编译期开关）');
+});
+}
+
+/// 探测 so 是否注入了指定全局对象（可选编译插件用，如 JSON5）。
+bool _hasGlobal(String libPath, String name) {
+  QuickjsEngine? probe;
+  try {
+    probe = QuickjsEngine.createWith(const JsEngineConfig(), libPath: libPath);
+    return probe.evaluate('typeof $name') == 'object';
+  } catch (_) {
+    return false;
+  } finally {
+    probe?.dispose();
+  }
 }
 
 /// 库文件里是否**缺少**指定导出符号名。

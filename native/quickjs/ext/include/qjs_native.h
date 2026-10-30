@@ -614,6 +614,9 @@ int qjs_url_init(JSContext *ctx);
 
 /* 初始化文本编解码模块（TextEncoder / TextDecoder 类） */
 int qjs_textcodec_init(JSContext *ctx);
+
+/* 初始化 JSON5 扩展模块（globalThis.JSON5，编译开关 QJS_ENABLE_JSON5） */
+int qjs_json5_init(JSContext *ctx, JSValueConst global_obj);
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

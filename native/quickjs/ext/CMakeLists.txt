@@ -52,6 +52,18 @@ file(GLOB EXT_MODULES_SRC
     ${EXT_DIR}/modules/*.c
 )
 
+# ---- 可选插件：全局 JSON5（编译期开关）----
+# ON  → 编译 modules/qjs_json5.c 并由 quickjs_ext.cpp 注册 globalThis.JSON5
+# OFF → 源文件不参与编译，二进制里没有该能力（默认）
+option(QJS_ENABLE_JSON5 "注入全局 JSON5 扩展（JSON5.parse/stringify）" OFF)
+if(QJS_ENABLE_JSON5)
+    add_compile_definitions(QJS_ENABLE_JSON5=1)
+    message(STATUS "qjs_engine: JSON5 全局插件已启用")
+else()
+    list(FILTER EXT_MODULES_SRC EXCLUDE REGEX "qjs_json5\\.c$")
+    message(STATUS "qjs_engine: JSON5 全局插件未启用（-DQJS_ENABLE_JSON5=ON 可开启）")
+endif()
+
 # ============================================================================
 # 3. wasm3 源码（与原 wrapper-android 构建一致的源列表）
 # ============================================================================

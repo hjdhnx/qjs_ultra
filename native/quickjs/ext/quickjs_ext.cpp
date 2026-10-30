@@ -84,6 +84,14 @@ int qjs_ext_install_all(JSContext *ctx)
     qjs_url_init(ctx);
     qjs_textcodec_init(ctx);
 
+    /* 可选插件示例：全局 JSON5（-DQJS_ENABLE_JSON5=ON 时编译并注册） */
+#ifdef QJS_ENABLE_JSON5
+    if (qjs_json5_init(ctx, global_obj) != 0) {
+        JS_FreeValue(ctx, global_obj);
+        return 0;
+    }
+#endif
+
     JS_FreeValue(ctx, global_obj);
 
     /* JS 层封装库注入 */

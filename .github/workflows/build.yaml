@@ -40,6 +40,11 @@ on:
         description: 'Release tag（留空 = build-<日期>-<短提交>）'
         required: false
         type: string
+      json5:
+        description: '注入全局 JSON5 插件（实验，编译期开关 QJS_ENABLE_JSON5）'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -123,6 +128,7 @@ jobs:
             -DANDROID_ABI="${{ matrix.abi }}" \
             -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
             -DQJS_USE_BORINGSSL_SOURCE=ON \
+            -DQJS_ENABLE_JSON5=${{ github.event.inputs.json5 == 'true' && 'ON' || 'OFF' }} \
             -DBUILD_TESTING=OFF
 
       - name: Build
@@ -215,6 +221,7 @@ jobs:
           cmake -S . -B build/windows-x64 -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DQJS_USE_BORINGSSL_SOURCE=ON \
+            -DQJS_ENABLE_JSON5=${{ github.event.inputs.json5 == 'true' && 'ON' || 'OFF' }} \
             -DBUILD_TESTING=OFF
 
       - name: Build

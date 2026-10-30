@@ -213,7 +213,7 @@ engine.runGC();
 
 引擎 so 由本仓 CI 出包：push 到 `main`（源码/构建链路径）自动构建四架构并发
 Release；手动：Actions → `Build quickjs_bridge` → Run workflow（`arches` /
-`release` / `releaseTag`）。本地交叉编译需要 `cmake >= 3.15`、`ninja`、
+`release` / `releaseTag` / `json5`）。本地交叉编译需要 `cmake >= 3.15`、`ninja`、
 `go >= 1.20`（BoringSSL 生成必需）、NDK r25+：
 
 ```sh
@@ -228,6 +228,11 @@ cmake --build build/arm64-v8a -j$(nproc)
 
 产物：`build/<abi>/libquickjs_bridge.so`（Windows DLL 由 CI 的 `build-windows`
 job 产出，MinGW 静态链接零第三方运行时依赖）。
+
+可选插件：编译期开关可裁剪全局能力，例如
+`-DQJS_ENABLE_JSON5=ON` 注入实验性的全局 `JSON5`（默认 OFF）；
+CI 手动触发时可勾选 `json5` 输入。扩展方法与示例见
+[docs/qjs-optional-plugins.md](docs/qjs-optional-plugins.md)。
 
 ### ABI 契约（维护者必读）
 
