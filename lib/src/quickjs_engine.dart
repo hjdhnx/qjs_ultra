@@ -174,7 +174,7 @@ class QuickjsEngine implements JsEngine {
         }
       });
 
-  /// 单次同步 JS 执行段的墙钟截止期（fjs shutdown 模型的同步宿主适配版）：
+  /// 单次同步 JS 执行段的墙钟截止期（同步宿主适配版）：
   /// Dart 侧 Timer 在同步 eval 期间不会触发，超时必须由 C 侧中断处理器
   /// 查墙钟。离开作用域即清除。
   ///
@@ -203,7 +203,7 @@ class QuickjsEngine implements JsEngine {
     }
   }
 
-  /// 求值结果统一出口（fjs async eval 语义的同步泵版）：
+  /// 求值结果统一出口（async eval 语义的同步泵版）：
   /// 结果是 promise 时泵微任务直至 settle 并取 settle 值；rejected 抛
   /// [JsEvalException]；队空仍 pending（在等宿主异步，本契约不支持）时
   /// 返回 null——promise 无 JSON-like Dart 表示。
@@ -580,13 +580,13 @@ class QuickjsEngine implements JsEngine {
     });
   }
 
-  /// 排空后台未处理 promise rejection 队列（fjs drainUnhandledJobErrors
-  /// 语义，C 侧 rejection tracker 收集）。这是 QuickjsEngine 的具体能力，
+  /// 排空后台未处理 promise rejection 队列（C 侧 rejection tracker
+  /// 收集）。这是 QuickjsEngine 的具体能力，
   /// 不在 [JsEngine] 抽象里。返回格式化文本与队满（32 条）累计丢弃数。
   ///
   /// 队列语义是「**曾**处于未处理状态」的 rejection：被 Dart 侧
   /// `_resolveResult` 转成异常抛出的 rejected promise，入队记录同样保留
-  /// （本层同步模型不做 fjs 的身份撤单/checkpoint 差集——无重放问题，
+  /// （本层同步模型不做身份撤单/checkpoint 差集——无重放问题，
   /// 诊断场景下宁多勿丢）。
   ({List<String> errors, int dropped}) drainUnhandledRejections() {
     _checkDisposed();
@@ -606,12 +606,12 @@ class QuickjsEngine implements JsEngine {
     }
   }
 
-  // ---------- 异步桥（fjs bridge_call 语义的同步宿主移植） ----------
+  // ---------- 异步桥（同步宿主移植） ----------
   //
   // JS 语义：`const r = await fn(args...)`。宿主函数被 JS 调用时同步创建
   // pending promise 返回（JS await 让出，引擎不被阻塞），Dart 侧 Future
   // 完成后经 qjs_settle_pending 唤醒并泵微任务推进 await 链。in-flight
-  // 调用期间 evaluateAsync/callAsync 的前台泵循环挂起等待（fjs 前台等待
+  // 调用期间 evaluateAsync/callAsync 的前台泵循环挂起等待（前台等待
   // + 后台兜底两层模型的单 isolate 版）。
 
   final _asyncInFlight = <int>{};
@@ -732,7 +732,7 @@ class QuickjsEngine implements JsEngine {
     c?.complete();
   }
 
-  /// 异步求值（fjs 前台等待语义）：结果为 promise 时泵微任务并等待
+  /// 异步求值（前台等待语义）：结果为 promise 时泵微任务并等待
   /// in-flight 异步宿主调用直至 settle；rejected 抛 [JsEvalException]。
   /// 队空仍 pending（等的是未注册的异步源）返回 null。
   /// 经 [_serialized] 闸门串行（多前台泵交错的窗口收敛，见其注释）。
@@ -870,7 +870,7 @@ class QuickjsEngine implements JsEngine {
 
   /// 安装 setTimeout/clearTimeout 宿主实现（Dart Timer 驱动）。回调经
   /// [callAsync] 执行：回调内 await 异步宿主函数可正常驱动；回调异常进
-  /// 后台错误（对齐 fjs guarded timers 语义）。未触发的 Timer 计入
+  /// 后台错误（guarded timers 语义）。未触发的 Timer 计入
   /// in-flight 活动集——evaluateAsync/callAsync 的前台泵会等它，而不是
   /// 队空提前放弃。setInterval 未提供（drpy3 bundle 无引用；需要时再加）。
   void installTimers() {
@@ -937,7 +937,7 @@ if (typeof globalThis.setImmediate === 'undefined') {
 ''');
   }
 
-  /// 注册源码模块供动态 `import(name)` 加载（对齐 fjs declareNewModule；
+  /// 注册源码模块供动态 `import(name)` 加载（drpy3 胶水的 evalModule 经此
   /// drpy3 胶水的 evalModule 经此注册源）。名字一经 import 不可替换
   /// （quickjs 模块缓存语义）——源热更需要用新名字重建调用。
   void registerModule(String name, String source) {
@@ -1210,7 +1210,7 @@ if (typeof globalThis.setImmediate === 'undefined') {
   }
 
   Object? _objectToDart(Pointer<QjsValue> slot, _Conv cx) {
-    // 护栏（fjs 同款上限）：超限/循环处降级 null——宁可丢值不可打爆宿主栈
+    // 护栏（深度/节点上限）：超限/循环处降级 null——宁可丢值不可打爆宿主栈
     if (++cx.nodes > _Conv.maxNodes || ++cx.depth > _Conv.maxDepth) {
       return null;
     }
@@ -1223,7 +1223,7 @@ if (typeof globalThis.setImmediate === 'undefined') {
       final bytes = _tryReadBytes(slot);
       if (bytes != null) return bytes;
 
-      // Date？借道 getTime()（fjs 同款，不碰引擎内部表示）。
+      // Date？借道 getTime()（不碰引擎内部表示）。
       // Invalid Date（NaN）不算命中，继续走对象路径。
       final ms = malloc<Double>();
       try {
@@ -1364,7 +1364,6 @@ if (typeof globalThis.setImmediate === 'undefined') {
           _bridge.makeInt32(_ctxPointer, out, i);
         } else if (i > 9007199254740991 || i < -9007199254740991) {
           // 超出 ±2^53（JSON 安全整数）：转 BigInt 保精度，降 double 丢位
-          // （fjs 同款策略）
           final text = i.toString();
           final ptr = text.toNativeUtf8();
           try {
@@ -1435,9 +1434,8 @@ if (typeof globalThis.setImmediate === 'undefined') {
     }
   }
 
-  /// 取走 pending 异常并拆解为结构化 [JsEvalException]（fjs error.rs
-  /// from_exception 的移植：name/message/stack 一次取全，按 name 归类，
-  /// syntax 错误从 stack 解析行号/列号）。
+  /// 取走 pending 异常并拆解为结构化 [JsEvalException]（name/message/stack
+  /// 一次取全，按 name 归类，syntax 错误从 stack 解析行号/列号）。
   JsEvalException _takeException() {
     final namePtr = malloc<Pointer<Utf8>>();
     final msgPtr = malloc<Pointer<Utf8>>();
@@ -1516,9 +1514,9 @@ if (typeof globalThis.setImmediate === 'undefined') {
     );
   }
 
-  /// 按 Error.name 归类（fjs 分类表的最小移植）。本内核栈溢出/中断/OOM
+  /// 按 Error.name 归类（最小分类表）。本内核栈溢出/中断/OOM
   /// 都走 InternalError（JS 侧无 InternalError 构造器，用户抛不出，
-  /// 不需要 fjs 那套防伪造消息匹配）；TypeError/ReferenceError 等用户可
+  /// 不需要防伪造消息匹配）；TypeError/ReferenceError 等用户可
   /// throw 伪造，但对诊断只影响分类字符串，不影响行为。
   static JsErrorKind _classifyError(
       String? name, String? message, bool inDeadline) {
@@ -1550,7 +1548,7 @@ if (typeof globalThis.setImmediate === 'undefined') {
   }
 
   /// 从 stack 首帧解析位置，支持 `at fn (file:line:col)` 与 `at file:line:col`
-  /// 两种形态（fjs parse_stack_position 同款）。
+  /// 两种形态。
   static (int, int)? _parseStackPosition(String stack) {
     for (final line in stack.split('\n')) {
       final m = RegExp(r'\(([^()]+):(\d+):(\d+)\)').firstMatch(line) ??
@@ -1583,7 +1581,7 @@ class _QuickjsFactory implements JsEngineFactory {
 ///
 /// [message] 为 "Name: message"（或兜底 coerce 文本）；[name] / [stack] 来自
 /// JS Error 对象；[line] / [column] 由 stack 首帧解析（syntax 错误）；
-/// [errorKind] 为结构化分类（fjs JsError 的最小移植）。
+/// [errorKind] 为结构化分类。
 class JsEvalException implements Exception {
   JsEvalException(
     this.message, {
@@ -1635,7 +1633,7 @@ enum JsErrorKind {
   generic,
 }
 
-/// 值转换护栏状态（fjs ConversionState 同款）：循环引用检测 +
+/// 值转换护栏状态：循环引用检测 +
 /// 深度/节点上限。按次新建、逐层传参——宿主回调里可再嵌套 evaluate
 /// （重入），不能放引擎字段。
 class _Conv {

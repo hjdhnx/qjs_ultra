@@ -192,16 +192,16 @@ engine.runGC();
 
 ## 与同类引擎包对比
 
-| | **qjs_ultra** | [fjs](https://github.com/fluttercandies/fjs) | flutter_js |
-|---|---|---|---|
-| 核心栈 | C（魔改 QuickJS + 扩展） | Rust（rquickjs + frb） | C（quickjs 分支） |
-| 内置 C 能力 | cheerio/URL/GBK/Buffer/crypto/WebCrypto/fs/zlib/SQLite/wasm3 | llrt 模块（fetch/timers 等） | 少量 |
-| 原生 WebAssembly | ✅ wasm3 | quickjs-ng 内建 | ❌ |
-| 同步宿主函数 | ✅ | ❌（仅异步） | ✅ |
-| 异步宿主函数 | ✅（同实例可与同步混用） | ✅ | ❌ |
-| 引擎级超时 | ✅ 中断处理器 | ✅ shutdown | 部分 |
-| 结构化错误分类 | ✅ 9 类 + 行列号 | ✅ 17 类 | 字符串 |
-| 构建依赖 | 无（CI 产物直用） | Rust 工具链（cargokit） | 无 |
+| | **qjs_ultra** | flutter_js |
+|---|---|---|
+| 核心栈 | C（魔改 QuickJS + 扩展） | C（quickjs 分支） |
+| 内置 C 能力 | cheerio/URL/GBK/Buffer/crypto/WebCrypto/fs/zlib/SQLite/wasm3 | 少量 |
+| 原生 WebAssembly | ✅ wasm3 | ❌ |
+| 同步宿主函数 | ✅ | ✅ |
+| 异步宿主函数 | ✅（同实例可与同步混用） | ❌ |
+| 引擎级超时 | ✅ 中断处理器 | 部分 |
+| 结构化错误分类 | ✅ 9 类 + 行列号 | 字符串 |
+| 构建依赖 | 无（CI 产物直用） | 无 |
 
 ## 测试
 

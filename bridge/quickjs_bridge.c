@@ -117,16 +117,15 @@ QJS_API void qjs_clear_callbacks(void *ctx_ptr) {
 
 /* ---------- 运行时控制块：中断/超时 + 未处理 rejection 管道 ----------
  *
- * 设计对齐 fjs（fluttercandies/fjs）的 shutdown.rs + error_sink.rs：
  * 1. JS_SetInterruptHandler 挂一个控制块，检查「手动中断旗」或「墙钟截止
  *    时间」。宿主（Dart）同步调用模型里起不了 Timer（eval 阻塞 isolate，
  *    Timer 永不触发），超时必须由 C 侧 handler 在 JS 执行间隙查墙钟——
  *    死循环 while(true){} 也能被打断成可捕获的 JS 异常，而不是卡死线程。
  * 2. JS_SetHostPromiseRejectionTracker 把未处理 rejection 格式化成纯文本
  *    进 per-runtime 有界环形队列（不持 JS 值，不阻碍 GC）。Dart 侧经
- *    qjs_poll_rejection 排空。不做 fjs 的「身份撤单/checkpoint 差集」——
- *    那是为异步 select 场景设计的，本层同步模型里 rejection 一旦入队
- *    就是最终事实，无重放问题。
+ *    qjs_poll_rejection 排空。本层同步模型不做「身份撤单/checkpoint 差集」
+ *    ——那是为异步 select 场景设计的，rejection 一旦入队就是最终事实，
+ *    无重放问题。
  */
 #define QJS_REJ_CAP 32
 
@@ -911,7 +910,7 @@ QJS_API int32_t qjs_bridge_new_uint8_array(JSContext *ctx, const uint8_t *buf,
   return 0;
 }
 
-/* ---------- 结构化错误 / Promise / Date / BigInt（fjs 封装对齐） ---------- */
+/* ---------- 结构化错误 / Promise / Date / BigInt ---------- */
 
 QJS_API void qjs_set_gc_threshold(JSRuntime *rt, size_t threshold) {
   JS_SetGCThreshold(rt, threshold);
@@ -1006,7 +1005,7 @@ QJS_API int32_t qjs_new_date(JSContext *ctx, double epoch_ms, JSValue *out) {
 }
 
 /* Date 读取：借道 getTime()（快照语义，返回自 epoch 毫秒；Invalid Date 为 NaN）。
- * 非 Date 对象返回 -1。fjs 同款做法——不碰引擎内部表示，兼容内核差异。 */
+ * 非 Date 对象返回 -1。不碰引擎内部表示，兼容内核差异。 */
 QJS_API int32_t qjs_get_date_ms(JSContext *ctx, JSValue *v, double *out) {
   JSValue get_time = JS_GetPropertyStr(ctx, *v, "getTime");
   if (JS_IsException(get_time)) return -1;
@@ -1022,7 +1021,7 @@ QJS_API int32_t qjs_get_date_ms(JSContext *ctx, JSValue *v, double *out) {
   return rc < 0 ? -1 : 0;
 }
 
-/* 借道全局 BigInt(str) 构造任意精度整数（十进制文本入参，fjs 同款）。
+/* 借道全局 BigInt(str) 构造任意精度整数（十进制文本入参）。
  * 非法文本走 JS 异常路径返回 -1。 */
 QJS_API int32_t qjs_new_bigint(JSContext *ctx, const char *dec, int32_t len,
                                JSValue *out) {
@@ -1045,7 +1044,7 @@ QJS_API int32_t qjs_new_bigint(JSContext *ctx, const char *dec, int32_t len,
   return JS_IsException(*out) ? -1 : 0;
 }
 
-/* ---------- 异步桥（fjs bridge_call 语义的同步宿主移植） ----------
+/* ---------- 异步桥（同步宿主移植） ----------
  *
  * 用法（Dart 侧 registerAsyncFunction）：
  *   1. JS 调宿主函数 → Dart trampoline 内调 qjs_new_pending_promise：

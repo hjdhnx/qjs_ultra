@@ -197,7 +197,7 @@ void main() {
   });
 });
 
-group('结构化错误（fjs JsError 对齐）', () {
+group('结构化错误', () {
   late QuickjsEngine engine;
   setUp(() {
     engine = QuickjsEngine.createWith(const JsEngineConfig(), libPath: libPath);
@@ -227,7 +227,7 @@ group('结构化错误（fjs JsError 对齐）', () {
   });
 
   test('栈溢出归类 stackOverflow 且引擎可复用', () {
-    // JS 栈上限必须显著小于宿主线程实际栈（fjs 同款告诫：否则保护
+    // JS 栈上限必须显著小于宿主线程实际栈（否则保护
     // 来不及触发就是宿主段错误而非可捕获 RangeError）。测试 isolate
     // 线程栈无富余，用 128KB 小栈让引擎保护稳定先行。
     final e2 = QuickjsEngine.createWith(
@@ -276,7 +276,7 @@ group('墙钟超时（interrupt handler）', () {
   });
 });
 
-group('值转换护栏（fjs ConversionState 对齐）', () {
+group('值转换护栏', () {
   test('自引用对象不炸宿主，非循环字段保留', () {
     final out = engine.evaluate('var a = {ok: 1}; a.self = a; a') as Map;
     expect(out['ok'], 1);
@@ -292,7 +292,7 @@ group('值转换护栏（fjs ConversionState 对齐）', () {
   });
 });
 
-group('Date / BigInt 编组（fjs value 对齐）', () {
+group('Date / BigInt 编组', () {
   test('JS Date → Dart DateTime', () {
     final d = engine.evaluate('new Date(1700000000000)');
     expect(d, isA<DateTime>());
@@ -323,7 +323,7 @@ group('Date / BigInt 编组（fjs value 对齐）', () {
   });
 });
 
-group('Promise settle（fjs async eval 同步泵版）', () {
+group('Promise settle（同步泵版）', () {
   test('async IIFE 的 promise 被等待并取 settle 值', () {
     final v = engine.evaluate(
       '(async () => { await Promise.resolve(); return 7; })()',
@@ -358,7 +358,7 @@ group('Promise settle（fjs async eval 同步泵版）', () {
   });
 });
 
-group('未处理 rejection 管道（fjs error sink 对齐）', () {
+group('未处理 rejection 管道', () {
   test(' rejection 被收集且可排空', () {
     // 构造不被 settle 等待的 rejection：放进 pending promise，绕过
     // _resolveResult 的等待路径（其 reject 会被直接抛出）

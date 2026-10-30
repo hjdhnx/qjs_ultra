@@ -55,8 +55,8 @@ class JsEngineConfig {
 
   /// JS 栈大小，字节。
   ///
-  /// **必须显著小于运行 JS 的宿主线程实际栈**（建议 ≤ 3/4，fjs 同款
-  /// 契约）：quickjs 的溢出保护以该值为界，若它接近/超过线程栈，
+  /// **必须显著小于运行 JS 的宿主线程实际栈**（建议 ≤ 3/4）：
+  /// quickjs 的溢出保护以该值为界，若它接近/超过线程栈，
   /// 死递归会在保护触发前直接段错误宿主，而非抛可捕获的
   /// `stackOverflow` 异常。
   final int stackSize;
@@ -69,7 +69,7 @@ class JsEngineConfig {
 
   /// 单次求值/调用的墙钟超时，毫秒；null 表示不限制。
   ///
-  /// 由引擎中断处理器实现（对齐 fjs 的 shutdown 模型）：到期后 JS 执行在
+  /// 由引擎中断处理器实现（shutdown 模型）：到期后 JS 执行在
   /// 下一个中断检查点被打断，抛出 `errorKind == timeout` 的
   /// [JsEvalException]。同步调用模型下 Dart 侧 Timer 不会触发
   /// （eval 阻塞 isolate），超时必须由 C 侧查墙钟——`while(true){}`

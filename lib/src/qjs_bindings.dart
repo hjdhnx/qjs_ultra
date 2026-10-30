@@ -323,8 +323,8 @@ class QjsBridge {
             Pointer<Uint8>, Int32, Pointer<QjsValue>)>>('qjs_bridge_new_uint8_array')
         .asFunction();
 
-    // ---- fjs 封装对齐新增（2026-09-27）：中断/超时、结构化异常、
-    // Promise settle、Date/BigInt、未处理 rejection 管道、GC 阈值 ----
+    // ---- 中断/超时、结构化异常、Promise settle、Date/BigInt、
+    // 未处理 rejection 管道、GC 阈值（2026-09-27）----
     installRuntimeCtl = _lk<NativeFunction<Int32 Function(Pointer<Void>)>>(
             'qjs_install_runtime_ctl')
         .asFunction();
@@ -478,7 +478,8 @@ class QjsBridge {
   late final int Function(
       Pointer<Void>, Pointer<Uint8>, int, Pointer<QjsValue>) newUint8Array;
 
-  // ---- fjs 封装对齐新增（2026-09-27）----
+  // ---- 中断/超时、结构化异常、Promise settle、Date/BigInt、
+  // 未处理 rejection 管道、GC 阈值（2026-09-27）----
   late final int Function(Pointer<Void>) installRuntimeCtl;
   late final void Function(Pointer<Void>) requestInterrupt;
   late final void Function(Pointer<Void>) clearInterrupt;

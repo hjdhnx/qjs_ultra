@@ -1,13 +1,12 @@
 // drpy3 × qjs_ultra 冒烟验收：本仓引擎（quickjs + C 扩展核心 + 异步桥）
-// 跑通 drpy3-fjs bundle 的六环节全链路。bundle **一字不改**（原为 fjs 构建，
-// 经 installDrpy3Shim 提供 globalThis.fjs 桥 + timers + atob/btoa 兜底）。
+// 跑通 drpy3 bundle 的六环节全链路。bundle **一字不改**（drpy3 仓构建产物），
+// 经 installDrpy3Shim 提供 globalThis.fjs 桥表 + timers。
 //
-// 与上游 drpy3 仓 hosts/fjs/integration_test/smoke_test.dart 同源（同一
-// bundle、同一演示稿 bm1、同一 mock 数据形状）；上游为 flutter
-// integration_test，此处为纯 dart test + 真实 so。
+// 与 drpy3 仓集成冒烟同源（同一 bundle、同一演示稿 bm1、同一 mock 数据
+// 形状）；上游为 flutter integration_test，此处为纯 dart test + 真实 so。
 //
-// fixture 同步要求：bundle 来自 DsPlayer assets/drpy3/（drpy3 仓
-// hosts/fjs/tools/build.mjs 产物），bm1 来自 hosts/fjs/assets/test/。
+// fixture 同步要求：bundle 来自 DsPlayer assets/drpy3/（drpy3 仓构建产物），
+// bm1 来自 drpy3 仓测试资源。
 // 运行：dart test test/drpy3_smoke_test.dart（需 QJS_ULTRA_LIB 或仓内约定路径有 so）
 import 'dart:async';
 import 'dart:convert';
@@ -143,7 +142,7 @@ Future<Map<String, dynamic>> _call(
 
 void main() {
   final libPath = resolveLibPath();
-  final bundleFile = File('test/fixtures/drpy3-fjs.bundle.js');
+  final bundleFile = File('test/fixtures/drpy3.bundle.js');
   final sourceFile = File('test/fixtures/bm1.source.js');
   if (libPath == null || !bundleFile.existsSync() || !sourceFile.existsSync()) {
     test('（跳过）drpy3 冒烟：缺 so 或 fixtures', () {}, skip: '需要 QJS_ULTRA_LIB + test/fixtures/*');
@@ -170,7 +169,7 @@ void main() {
         code = code.replaceAll(h, b);
       }
 
-      // ① shim（fjs 桥 + timers + atob/btoa 兜底）
+      // ① shim（桥表 + timers）
       var moduleSeq = 0;
       engine.installDrpy3Shim((message) async {
         final msg = message as Map;
@@ -196,7 +195,7 @@ void main() {
       // ② 装载 bundle（模块名 drpy3，六环节导出挂 __ 前缀全局）
       await engine.loadModuleToGlobals('drpy3', bundleFile.readAsStringSync());
 
-      // ③ 能力表：五件套全 host + 原生 WebAssembly（wasm3，fjs 所无）
+      // ③ 能力表：五件套全 host + 原生 WebAssembly（wasm3）
       final caps = await _call(engine, 'drpy3Capabilities', []);
       expect(caps['req'], 'host');
       expect(caps['pdfh'], 'host');
