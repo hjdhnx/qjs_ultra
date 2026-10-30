@@ -1,18 +1,16 @@
 /*
- * qjs_json5.c — 可选扩展模块：全局 JSON5 对象（实验性示例）
+ * qjs_json5.c — 可选扩展模块：全局 JSON5 对象
  *
  * 注册（仅在 QJS_ENABLE_JSON5 编译开关打开时）：
- *   globalThis.JSON5 = { parse(text), stringify(value[, replacer[, space]]) }
+ *   globalThis.JSON5 = { parse(text[, reviver]), stringify(value[, replacer[, space]]) }
  *
- * JSON5 语法（https://json5.org/）相对 JSON 的扩展：
- *   - 注释：行注释与块注释
- *   - 对象键：可省略引号（IdentifierName），允许尾逗号
- *   - 字符串：单/双引号、\x / \u 转义、续行、跨行字符串
- *   - 数字：+/- 前缀、十六进制 0x、前导/尾随小数点、Infinity、NaN
- *   - 空白：NBSP / BOM / U+2028 / U+2029 等
- *
- * stringify 直接复用 JSON.stringify（JSON 输出是合法 JSON5），因此
- * 不额外维护一套序列化逻辑；需要 JSON5 风格输出时可在后续迭代补充。
+ * 实现分工：
+ *   - parse：vendored libpdjson5（Unlicense，完整 JSON5 语法、流式事件 API），
+ *     本文件把事件流组装成 JSValue，并实现官方语义的 reviver；
+ *   - stringify：注入官方 json5 的 stringify 算法（MIT，见
+ *     qjs_json5_stringify.js / qjs_json5_stringify_js.h），保证引号选择、
+ *     toJSON5/toJSON、replacer、space、尾逗号、循环检测、BigInt 抛错等
+ *     行为与 json5 包一致。
  *
  * 编译开关：cmake -DQJS_ENABLE_JSON5=ON（默认 OFF，见 ext/CMakeLists.txt）。
  */
@@ -20,169 +18,61 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "../third_party/libpdjson5/pdjson5.h"
+#include "qjs_json5_stringify_js.h"
+
 #define J5_MAX_DEPTH 512
 
+/* ------------------------------------------------------------------ */
+/* libpdjson5 分配器（复用 QuickJS ctx 堆）                            */
+/* ------------------------------------------------------------------ */
+
+static void *j5_alloc(size_t size, void *ud)
+{
+    return js_malloc((JSContext *)ud, size);
+}
+
+static void *j5_realloc(void *ptr, size_t size, void *ud)
+{
+    return js_realloc((JSContext *)ud, ptr, size);
+}
+
+static void j5_dealloc(void *ptr, size_t size, void *ud)
+{
+    (void)size;
+    js_free((JSContext *)ud, ptr);
+}
+
+static const pdjson_allocator j5_allocator = {
+    j5_alloc, j5_realloc, j5_dealloc
+};
+
+/* ------------------------------------------------------------------ */
+/* 解析                                                                */
+/* ------------------------------------------------------------------ */
+
 typedef struct {
-    JSContext  *ctx;
-    const char *start;
-    const char *p;
-    const char *end;
+    JSContext    *ctx;
+    pdjson_stream stream;
 } J5Parser;
 
-typedef struct {
-    char  *buf;
-    size_t len;
-    size_t cap;
-} J5Buf;
+static JSValue j5_parse_value(J5Parser *p, int depth);
 
-/* ------------------------------------------------------------------ */
-/* 基础工具                                                            */
-/* ------------------------------------------------------------------ */
-
-static void j5_syntax(J5Parser *s, const char *msg)
+static JSValue j5_throw_parse_error(J5Parser *p)
 {
-    JS_ThrowSyntaxError(s->ctx, "JSON5: %s (offset %d)", msg,
-                        (int)(s->p - s->start));
+    const char *msg = pdjson_get_error(&p->stream);
+    JS_ThrowSyntaxError(p->ctx, "JSON5: %s (line %llu, column %llu)",
+                        msg ? msg : "parse error",
+                        (unsigned long long)pdjson_get_line(&p->stream),
+                        (unsigned long long)pdjson_get_column(&p->stream));
+    return JS_EXCEPTION;
 }
 
-static int j5_is_ascii_ws(unsigned char c)
-{
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
-           c == '\f' || c == '\v';
-}
-
-static int j5_is_line_term(const J5Parser *s)
-{
-    unsigned char c;
-    if (s->p >= s->end)
-        return 0;
-    c = (unsigned char)*s->p;
-    if (c == '\n' || c == '\r')
-        return 1;
-    /* U+2028 / U+2029 */
-    return s->end - s->p >= 3 && c == 0xE2 && s->p[1] == (char)0x80 &&
-           ((unsigned char)s->p[2] == 0xA8 || (unsigned char)s->p[2] == 0xA9);
-}
-
-/* 跳过 JSON5 空白：ASCII ws + NBSP + BOM + U+2028/U+2029。返回 1 表示消费了空白。 */
-static int j5_skip_one_ws(J5Parser *s)
-{
-    unsigned char c = (unsigned char)*s->p;
-    if (j5_is_ascii_ws(c)) {
-        s->p++;
-        return 1;
-    }
-    if (s->end - s->p >= 2 && c == 0xC2 && (unsigned char)s->p[1] == 0xA0) {
-        s->p += 2; /* U+00A0 NBSP */
-        return 1;
-    }
-    if (s->end - s->p >= 3 && c == 0xEF &&
-        (unsigned char)s->p[1] == 0xBB && (unsigned char)s->p[2] == 0xBF) {
-        s->p += 3; /* U+FEFF BOM */
-        return 1;
-    }
-    if (s->end - s->p >= 3 && c == 0xE2 &&
-        (unsigned char)s->p[1] == 0x80 &&
-        ((unsigned char)s->p[2] == 0xA8 || (unsigned char)s->p[2] == 0xA9)) {
-        s->p += 3; /* U+2028 / U+2029 */
-        return 1;
-    }
-    return 0;
-}
-
-/* 跳过空白与注释。返回 0 成功，-1 失败（异常已挂到 ctx）。 */
-static int j5_skip_ws_comments(J5Parser *s)
-{
-    for (;;) {
-        if (s->p < s->end && j5_skip_one_ws(s))
-            continue;
-        if (s->end - s->p >= 2 && s->p[0] == '/' && s->p[1] == '/') {
-            s->p += 2;
-            while (s->p < s->end && !j5_is_line_term(s))
-                s->p++;
-            continue;
-        }
-        if (s->end - s->p >= 2 && s->p[0] == '/' && s->p[1] == '*') {
-            s->p += 2;
-            while (s->end - s->p >= 2 &&
-                   !(s->p[0] == '*' && s->p[1] == '/'))
-                s->p++;
-            if (s->end - s->p < 2) {
-                j5_syntax(s, "unterminated block comment");
-                return -1;
-            }
-            s->p += 2;
-            continue;
-        }
-        return 0;
-    }
-}
-
-static int j5_buf_reserve(J5Parser *s, J5Buf *b, size_t extra)
-{
-    size_t need, cap;
-    char *nb;
-    if (extra > (size_t)-1 - b->len)
-        return -1;
-    need = b->len + extra;
-    if (need <= b->cap)
-        return 0;
-    cap = b->cap ? b->cap : 32;
-    while (cap < need) {
-        if (cap > ((size_t)-1) / 2)
-            return -1;
-        cap *= 2;
-    }
-    nb = (char *)js_realloc(s->ctx, b->buf, cap);
-    if (!nb)
-        return -1;
-    b->buf = nb;
-    b->cap = cap;
-    return 0;
-}
-
-static int j5_buf_putc(J5Parser *s, J5Buf *b, unsigned char c)
-{
-    if (j5_buf_reserve(s, b, 1))
-        return -1;
-    b->buf[b->len++] = (char)c;
-    return 0;
-}
-
-static int j5_buf_put_utf8(J5Parser *s, J5Buf *b, uint32_t cp)
-{
-    char tmp[4];
-    int n;
-    if (cp < 0x80) {
-        tmp[0] = (char)cp;
-        n = 1;
-    } else if (cp < 0x800) {
-        tmp[0] = (char)(0xC0 | (cp >> 6));
-        tmp[1] = (char)(0x80 | (cp & 0x3F));
-        n = 2;
-    } else if (cp < 0x10000) {
-        tmp[0] = (char)(0xE0 | (cp >> 12));
-        tmp[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        tmp[2] = (char)(0x80 | (cp & 0x3F));
-        n = 3;
-    } else {
-        tmp[0] = (char)(0xF0 | (cp >> 18));
-        tmp[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-        tmp[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        tmp[3] = (char)(0x80 | (cp & 0x3F));
-        n = 4;
-    }
-    if (j5_buf_reserve(s, b, (size_t)n))
-        return -1;
-    memcpy(b->buf + b->len, tmp, (size_t)n);
-    b->len += (size_t)n;
-    return 0;
-}
-
-static int j5_hexval(unsigned char c)
+static int j5_hexval(int c)
 {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -190,476 +80,353 @@ static int j5_hexval(unsigned char c)
     return -1;
 }
 
-static int j5_is_ident_start(unsigned char c)
+/* JSON5 number token -> double。libpdjson5 已校验语法；这里只做转换。 */
+static JSValue j5_make_number(J5Parser *p, const char *s, size_t len)
 {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           c == '_' || c == '$' || c >= 0x80;
-}
-
-static int j5_is_ident_char(unsigned char c)
-{
-    return j5_is_ident_start(c) || (c >= '0' && c <= '9');
-}
-
-/* ------------------------------------------------------------------ */
-/* 字符串                                                              */
-/* ------------------------------------------------------------------ */
-
-static JSValue j5_parse_string(J5Parser *s)
-{
-    J5Buf b = { NULL, 0, 0 };
-    unsigned char quote = (unsigned char)*s->p++;
-    JSValue ret = JS_EXCEPTION;
-
-    for (;;) {
-        unsigned char c;
-        if (s->p >= s->end) {
-            j5_syntax(s, "unterminated string");
-            goto fail;
-        }
-        c = (unsigned char)*s->p++;
-        if (c == quote)
-            break;
-
-        if (c != '\\') {
-            if (j5_buf_putc(s, &b, c))
-                goto oom;
-            continue;
-        }
-
-        if (s->p >= s->end) {
-            j5_syntax(s, "unterminated string escape");
-            goto fail;
-        }
-        c = (unsigned char)*s->p++;
-        switch (c) {
-        case 'b': c = '\b'; break;
-        case 'f': c = '\f'; break;
-        case 'n': c = '\n'; break;
-        case 'r': c = '\r'; break;
-        case 't': c = '\t'; break;
-        case 'v': c = '\v'; break;
-        case '0': c = '\0'; break; /* 宽松：不检查后随十进制数字 */
-        case 'x': {
-            int h1, h2;
-            if (s->end - s->p < 2) {
-                j5_syntax(s, "invalid \\x escape");
-                goto fail;
-            }
-            h1 = j5_hexval((unsigned char)s->p[0]);
-            h2 = j5_hexval((unsigned char)s->p[1]);
-            if (h1 < 0 || h2 < 0) {
-                j5_syntax(s, "invalid \\x escape");
-                goto fail;
-            }
-            c = (unsigned char)((h1 << 4) | h2);
-            s->p += 2;
-            break;
-        }
-        case 'u': {
-            uint32_t cp = 0;
-            int i;
-            if (s->end - s->p < 4) {
-                j5_syntax(s, "invalid \\u escape");
-                goto fail;
-            }
-            for (i = 0; i < 4; i++) {
-                int h = j5_hexval((unsigned char)s->p[i]);
-                if (h < 0) {
-                    j5_syntax(s, "invalid \\u escape");
-                    goto fail;
-                }
-                cp = (cp << 4) | (uint32_t)h;
-            }
-            s->p += 4;
-            /* 代理对合并；孤立代理替换为 U+FFFD（避免产出非法 UTF-8） */
-            if (cp >= 0xD800 && cp <= 0xDBFF &&
-                s->end - s->p >= 6 && s->p[0] == '\\' && s->p[1] == 'u') {
-                uint32_t lo = 0;
-                int ok = 1;
-                for (i = 0; i < 4; i++) {
-                    int h = j5_hexval((unsigned char)s->p[2 + i]);
-                    if (h < 0) { ok = 0; break; }
-                    lo = (lo << 4) | (uint32_t)h;
-                }
-                if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                    s->p += 6;
-                }
-            }
-            if (cp >= 0xD800 && cp <= 0xDFFF)
-                cp = 0xFFFD;
-            if (j5_buf_put_utf8(s, &b, cp))
-                goto oom;
-            continue;
-        }
-        case '\r':
-            if (s->p < s->end && *s->p == '\n')
-                s->p++;
-            continue; /* 续行：不产出字符 */
-        case '\n':
-            continue; /* 续行 */
-        case 0xE2:
-            /* \ + U+2028 / U+2029 续行 */
-            if (s->end - s->p >= 2 && (unsigned char)s->p[0] == 0x80 &&
-                ((unsigned char)s->p[1] == 0xA8 ||
-                 (unsigned char)s->p[1] == 0xA9)) {
-                s->p += 2;
-                continue;
-            }
-            break;
-        default:
-            break; /* 其他转义：字符本身（如 \" \' \\ \/） */
-        }
-        if (j5_buf_putc(s, &b, c))
-            goto oom;
-    }
-
-    ret = JS_NewStringLen(s->ctx, b.buf ? b.buf : "", b.len);
-    js_free(s->ctx, b.buf);
-    return ret;
-
-oom:
-    JS_ThrowOutOfMemory(s->ctx);
-fail:
-    js_free(s->ctx, b.buf);
-    return ret;
-}
-
-/* ------------------------------------------------------------------ */
-/* 数字                                                                */
-/* ------------------------------------------------------------------ */
-
-static int j5_is_number_delim(const J5Parser *s)
-{
-    unsigned char c;
-    if (s->p >= s->end)
-        return 1;
-    c = (unsigned char)*s->p;
-    if (j5_is_ascii_ws(c) || c == ',' || c == ']' || c == '}' || c == '/')
-        return 1;
-    /* 多字节空白/注释起始（保守放行，交给上层统一报错或继续解析） */
-    if (c == 0xC2 || c == 0xE2 || c == 0xEF)
-        return 1;
-    return 0;
-}
-
-static JSValue j5_parse_number(J5Parser *s)
-{
-    const char *num_start = s->p;
+    JSContext *ctx = p->ctx;
+    char stackbuf[128];
+    char *buf = stackbuf;
+    const char *q;
+    double d;
     int neg = 0;
-    double v;
 
-    if (s->p < s->end && (*s->p == '+' || *s->p == '-')) {
-        neg = (*s->p == '-');
-        s->p++;
+    if (len + 1 > sizeof(stackbuf)) {
+        buf = (char *)js_malloc(ctx, len + 1);
+        if (!buf)
+            return JS_ThrowOutOfMemory(ctx);
+    }
+    memcpy(buf, s, len);
+    buf[len] = '\0';
+
+    q = buf;
+    if (*q == '+' || *q == '-') {
+        neg = (*q == '-');
+        q++;
     }
 
-    if (s->end - s->p >= 8 && memcmp(s->p, "Infinity", 8) == 0) {
-        s->p += 8;
-        if (!j5_is_number_delim(s)) {
-            j5_syntax(s, "invalid number");
-            return JS_EXCEPTION;
-        }
-        return JS_NewFloat64(s->ctx, neg ? -INFINITY : INFINITY);
-    }
-    if (s->end - s->p >= 3 && memcmp(s->p, "NaN", 3) == 0) {
-        s->p += 3;
-        if (!j5_is_number_delim(s)) {
-            j5_syntax(s, "invalid number");
-            return JS_EXCEPTION;
-        }
-        return JS_NewFloat64(s->ctx, NAN);
-    }
-
-    /* 十六进制整数（JSON5 扩展） */
-    if (s->end - s->p >= 2 && s->p[0] == '0' &&
-        (s->p[1] == 'x' || s->p[1] == 'X')) {
-        s->p += 2;
-        if (s->p >= s->end || j5_hexval((unsigned char)*s->p) < 0) {
-            j5_syntax(s, "invalid hexadecimal number");
-            return JS_EXCEPTION;
-        }
-        v = 0;
-        while (s->p < s->end) {
-            int h = j5_hexval((unsigned char)*s->p);
-            if (h < 0)
-                break;
-            v = v * 16 + h;
-            s->p++;
-        }
-        if (!j5_is_number_delim(s)) {
-            j5_syntax(s, "invalid number");
-            return JS_EXCEPTION;
-        }
-        return JS_NewFloat64(s->ctx, neg ? -v : v);
-    }
-
-    /* 十进制：digits [. digits] | . digits，可带指数 */
-    {
-        int digits = 0;
-        while (s->p < s->end && *s->p >= '0' && *s->p <= '9') {
-            s->p++;
-            digits = 1;
-        }
-        if (s->p < s->end && *s->p == '.') {
-            s->p++;
-            while (s->p < s->end && *s->p >= '0' && *s->p <= '9') {
-                s->p++;
-                digits = 1;
+    if (!strcmp(q, "Infinity")) {
+        d = neg ? -INFINITY : INFINITY;
+    } else if (!strcmp(q, "NaN")) {
+        d = NAN;
+    } else if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) {
+        const char *h = q + 2;
+        double v = 0;
+        while (*h) {
+            int hv = j5_hexval((unsigned char)*h);
+            if (hv < 0) {
+                if (buf != stackbuf) js_free(ctx, buf);
+                return JS_ThrowSyntaxError(ctx, "JSON5: invalid hexadecimal number");
             }
+            v = v * 16 + hv;
+            h++;
         }
-        if (!digits) {
-            j5_syntax(s, "invalid number");
-            return JS_EXCEPTION;
-        }
-        if (s->p < s->end && (*s->p == 'e' || *s->p == 'E')) {
-            const char *save = s->p;
-            int exp_digits = 0;
-            s->p++;
-            if (s->p < s->end && (*s->p == '+' || *s->p == '-'))
-                s->p++;
-            while (s->p < s->end && *s->p >= '0' && *s->p <= '9') {
-                s->p++;
-                exp_digits = 1;
-            }
-            if (!exp_digits)
-                s->p = save; /* 回退：把 e 当作非法分隔，下面统一报错 */
+        d = neg ? -v : v;
+    } else {
+        char *end = NULL;
+        d = strtod(buf, &end);
+        if (!end || end != buf + len) {
+            if (buf != stackbuf) js_free(ctx, buf);
+            return JS_ThrowSyntaxError(ctx, "JSON5: invalid number");
         }
     }
 
-    if (!j5_is_number_delim(s)) {
-        j5_syntax(s, "invalid number");
-        return JS_EXCEPTION;
-    }
-
-    {
-        size_t n = (size_t)(s->p - num_start);
-        char *tmp = (char *)js_malloc(s->ctx, n + 1);
-        if (!tmp) {
-            JS_ThrowOutOfMemory(s->ctx);
-            return JS_EXCEPTION;
-        }
-        memcpy(tmp, num_start, n);
-        tmp[n] = '\0';
-        v = strtod(tmp, NULL);
-        js_free(s->ctx, tmp);
-    }
-    return JS_NewFloat64(s->ctx, v);
+    if (buf != stackbuf) js_free(ctx, buf);
+    return JS_NewFloat64(ctx, d);
 }
 
-/* ------------------------------------------------------------------ */
-/* 值 / 对象 / 数组                                                    */
-/* ------------------------------------------------------------------ */
-
-static JSValue j5_parse_value(J5Parser *s, int depth);
-
-static JSValue j5_parse_object(J5Parser *s, int depth)
+static JSValue j5_parse_object(J5Parser *p, int depth)
 {
-    JSValue obj;
-
-    if (depth >= J5_MAX_DEPTH) {
-        j5_syntax(s, "nesting too deep");
-        return JS_EXCEPTION;
-    }
-    s->p++; /* '{' */
-    obj = JS_NewObject(s->ctx);
+    JSContext *ctx = p->ctx;
+    JSValue obj = JS_NewObject(ctx);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
 
     for (;;) {
-        JSValue key = JS_UNDEFINED, val;
-        JSAtom atom;
-
-        if (j5_skip_ws_comments(s)) {
-            JS_FreeValue(s->ctx, obj);
-            return JS_EXCEPTION;
-        }
-        if (s->p < s->end && *s->p == '}') {
-            s->p++;
+        enum pdjson_type t = pdjson_next(&p->stream);
+        if (t == PDJSON_OBJECT_END) {
             return obj;
         }
+        if (t == PDJSON_ERROR) {
+            JS_FreeValue(ctx, obj);
+            return j5_throw_parse_error(p);
+        }
+        if (t != PDJSON_NAME) {
+            JS_FreeValue(ctx, obj);
+            return JS_ThrowSyntaxError(ctx, "JSON5: object key expected");
+        }
 
-        /* 键：字符串或 IdentifierName */
-        if (s->p < s->end && (*s->p == '"' || *s->p == '\'')) {
-            key = j5_parse_string(s);
+        {
+            size_t name_len = 0;
+            const char *name = pdjson_get_name(&p->stream, &name_len);
+            JSValue key, val;
+            JSAtom atom;
+
+            if (!name) {
+                JS_FreeValue(ctx, obj);
+                return JS_ThrowOutOfMemory(ctx);
+            }
+            key = JS_NewStringLen(ctx, name, name_len > 0 ? name_len - 1 : 0);
             if (JS_IsException(key)) {
-                JS_FreeValue(s->ctx, obj);
+                JS_FreeValue(ctx, obj);
                 return JS_EXCEPTION;
             }
-        } else if (s->p < s->end &&
-                   j5_is_ident_start((unsigned char)*s->p)) {
-            const char *kstart = s->p;
-            while (s->p < s->end && j5_is_ident_char((unsigned char)*s->p))
-                s->p++;
-            key = JS_NewStringLen(s->ctx, kstart, (size_t)(s->p - kstart));
-            if (JS_IsException(key)) {
-                JS_FreeValue(s->ctx, obj);
+            val = j5_parse_value(p, depth + 1);
+            if (JS_IsException(val)) {
+                JS_FreeValue(ctx, key);
+                JS_FreeValue(ctx, obj);
                 return JS_EXCEPTION;
             }
-        } else {
-            j5_syntax(s, "object key expected");
-            JS_FreeValue(s->ctx, obj);
-            return JS_EXCEPTION;
+            atom = JS_ValueToAtom(ctx, key);
+            JS_FreeValue(ctx, key);
+            if (atom == JS_ATOM_NULL) {
+                JS_FreeValue(ctx, val);
+                JS_FreeValue(ctx, obj);
+                return JS_EXCEPTION;
+            }
+            /* Define 而非 Set：__proto__ 也作为普通自有属性 */
+            if (JS_DefinePropertyValue(ctx, obj, atom, val, JS_PROP_C_W_E) < 0) {
+                JS_FreeAtom(ctx, atom);
+                JS_FreeValue(ctx, obj);
+                return JS_EXCEPTION;
+            }
+            JS_FreeAtom(ctx, atom);
         }
-
-        if (j5_skip_ws_comments(s)) {
-            JS_FreeValue(s->ctx, key);
-            JS_FreeValue(s->ctx, obj);
-            return JS_EXCEPTION;
-        }
-        if (s->p >= s->end || *s->p != ':') {
-            j5_syntax(s, "':' expected after object key");
-            JS_FreeValue(s->ctx, key);
-            JS_FreeValue(s->ctx, obj);
-            return JS_EXCEPTION;
-        }
-        s->p++;
-        if (j5_skip_ws_comments(s)) {
-            JS_FreeValue(s->ctx, key);
-            JS_FreeValue(s->ctx, obj);
-            return JS_EXCEPTION;
-        }
-
-        val = j5_parse_value(s, depth + 1);
-        if (JS_IsException(val)) {
-            JS_FreeValue(s->ctx, key);
-            JS_FreeValue(s->ctx, obj);
-            return JS_EXCEPTION;
-        }
-
-        atom = JS_ValueToAtom(s->ctx, key);
-        JS_FreeValue(s->ctx, key);
-        if (atom == JS_ATOM_NULL) {
-            JS_FreeValue(s->ctx, val);
-            JS_FreeValue(s->ctx, obj);
-            return JS_EXCEPTION;
-        }
-        /* 用 Define 而非 Set：__proto__ 等键也作为普通自有属性 */
-        if (JS_DefinePropertyValue(s->ctx, obj, atom, val, JS_PROP_C_W_E) < 0) {
-            JS_FreeAtom(s->ctx, atom);
-            JS_FreeValue(s->ctx, obj);
-            return JS_EXCEPTION;
-        }
-        JS_FreeAtom(s->ctx, atom);
-
-        if (j5_skip_ws_comments(s)) {
-            JS_FreeValue(s->ctx, obj);
-            return JS_EXCEPTION;
-        }
-        if (s->p < s->end && *s->p == ',') {
-            s->p++;
-            continue; /* 允许尾逗号：下一轮先看 '}' */
-        }
-        if (s->p < s->end && *s->p == '}') {
-            s->p++;
-            return obj;
-        }
-        j5_syntax(s, "',' or '}' expected");
-        JS_FreeValue(s->ctx, obj);
-        return JS_EXCEPTION;
     }
 }
 
-static JSValue j5_parse_array(J5Parser *s, int depth)
+static JSValue j5_parse_array(J5Parser *p, int depth)
 {
-    JSValue arr;
+    JSContext *ctx = p->ctx;
+    JSValue arr = JS_NewArray(ctx);
     uint32_t idx = 0;
 
-    if (depth >= J5_MAX_DEPTH) {
-        j5_syntax(s, "nesting too deep");
-        return JS_EXCEPTION;
-    }
-    s->p++; /* '[' */
-    arr = JS_NewArray(s->ctx);
     if (JS_IsException(arr))
         return JS_EXCEPTION;
 
     for (;;) {
-        JSValue val;
-        if (j5_skip_ws_comments(s)) {
-            JS_FreeValue(s->ctx, arr);
-            return JS_EXCEPTION;
-        }
-        if (s->p < s->end && *s->p == ']') {
-            s->p++;
+        enum pdjson_type t = pdjson_next(&p->stream);
+        if (t == PDJSON_ARRAY_END)
             return arr;
+        if (t == PDJSON_ERROR) {
+            JS_FreeValue(ctx, arr);
+            return j5_throw_parse_error(p);
         }
         if (idx == UINT32_MAX) {
-            j5_syntax(s, "array too long");
-            JS_FreeValue(s->ctx, arr);
-            return JS_EXCEPTION;
+            JS_FreeValue(ctx, arr);
+            return JS_ThrowSyntaxError(ctx, "JSON5: array too long");
         }
-        val = j5_parse_value(s, depth + 1);
-        if (JS_IsException(val)) {
-            JS_FreeValue(s->ctx, arr);
-            return JS_EXCEPTION;
+        /* 把刚消费的事件交给值解析（用 peek/reset 不可行，改为按类型分发） */
+        {
+            JSValue val;
+            switch (t) {
+            case PDJSON_OBJECT:
+                val = j5_parse_object(p, depth + 1);
+                break;
+            case PDJSON_ARRAY:
+                val = j5_parse_array(p, depth + 1);
+                break;
+            case PDJSON_STRING: {
+                size_t n = 0;
+                const char *s = pdjson_get_value(&p->stream, &n);
+                val = s ? JS_NewStringLen(ctx, s, n > 0 ? n - 1 : 0)
+                        : JS_ThrowOutOfMemory(ctx);
+                break;
+            }
+            case PDJSON_NUMBER: {
+                size_t n = 0;
+                const char *s = pdjson_get_value(&p->stream, &n);
+                val = s ? j5_make_number(p, s, n > 0 ? n - 1 : 0)
+                        : JS_ThrowOutOfMemory(ctx);
+                break;
+            }
+            case PDJSON_TRUE:  val = JS_TRUE; break;
+            case PDJSON_FALSE: val = JS_FALSE; break;
+            case PDJSON_NULL:  val = JS_NULL; break;
+            default:
+                JS_FreeValue(ctx, arr);
+                return JS_ThrowSyntaxError(ctx, "JSON5: unexpected token in array");
+            }
+            if (JS_IsException(val)) {
+                JS_FreeValue(ctx, arr);
+                return JS_EXCEPTION;
+            }
+            if (JS_SetPropertyUint32(ctx, arr, idx++, val) < 0) {
+                JS_FreeValue(ctx, arr);
+                return JS_EXCEPTION;
+            }
         }
-        if (JS_SetPropertyUint32(s->ctx, arr, idx++, val) < 0) {
-            JS_FreeValue(s->ctx, arr);
-            return JS_EXCEPTION;
-        }
-        if (j5_skip_ws_comments(s)) {
-            JS_FreeValue(s->ctx, arr);
-            return JS_EXCEPTION;
-        }
-        if (s->p < s->end && *s->p == ',') {
-            s->p++;
-            continue; /* 允许尾逗号 */
-        }
-        if (s->p < s->end && *s->p == ']') {
-            s->p++;
-            return arr;
-        }
-        j5_syntax(s, "',' or ']' expected");
-        JS_FreeValue(s->ctx, arr);
-        return JS_EXCEPTION;
     }
 }
 
-static JSValue j5_parse_value(J5Parser *s, int depth)
+/* 消费下一个事件并解析为一个值（对象/数组内部递归入口）。 */
+static JSValue j5_parse_value(J5Parser *p, int depth)
 {
-    unsigned char c;
-    if (s->p >= s->end) {
-        j5_syntax(s, "unexpected end of input");
-        return JS_EXCEPTION;
+    JSContext *ctx = p->ctx;
+    enum pdjson_type t;
+
+    if (depth >= J5_MAX_DEPTH)
+        return JS_ThrowSyntaxError(ctx, "JSON5: nesting too deep");
+
+    t = pdjson_next(&p->stream);
+    switch (t) {
+    case PDJSON_OBJECT:
+        return j5_parse_object(p, depth);
+    case PDJSON_ARRAY:
+        return j5_parse_array(p, depth);
+    case PDJSON_STRING: {
+        size_t n = 0;
+        const char *s = pdjson_get_value(&p->stream, &n);
+        if (!s)
+            return JS_ThrowOutOfMemory(ctx);
+        return JS_NewStringLen(ctx, s, n > 0 ? n - 1 : 0);
     }
-    c = (unsigned char)*s->p;
-    if (c == '{')
-        return j5_parse_object(s, depth);
-    if (c == '[')
-        return j5_parse_array(s, depth);
-    if (c == '"' || c == '\'')
-        return j5_parse_string(s);
-    if (c == '+' || c == '-' || c == '.' ||
-        (c >= '0' && c <= '9') || c == 'I' || c == 'N')
-        return j5_parse_number(s);
-    if (s->end - s->p >= 4 && memcmp(s->p, "null", 4) == 0) {
-        s->p += 4;
-        return JS_NULL;
+    case PDJSON_NUMBER: {
+        size_t n = 0;
+        const char *s = pdjson_get_value(&p->stream, &n);
+        if (!s)
+            return JS_ThrowOutOfMemory(ctx);
+        return j5_make_number(p, s, n > 0 ? n - 1 : 0);
     }
-    if (s->end - s->p >= 4 && memcmp(s->p, "true", 4) == 0) {
-        s->p += 4;
-        return JS_TRUE;
+    case PDJSON_TRUE:  return JS_TRUE;
+    case PDJSON_FALSE: return JS_FALSE;
+    case PDJSON_NULL:  return JS_NULL;
+    case PDJSON_ERROR: return j5_throw_parse_error(p);
+    default:
+        return JS_ThrowSyntaxError(ctx, "JSON5: unexpected end of input");
     }
-    if (s->end - s->p >= 5 && memcmp(s->p, "false", 5) == 0) {
-        s->p += 5;
-        return JS_FALSE;
-    }
-    j5_syntax(s, "unexpected token");
-    return JS_EXCEPTION;
 }
 
 /* ------------------------------------------------------------------ */
-/* 全局函数                                                            */
+/* reviver（与 JSON.parse 相同的内部化语义）                          */
 /* ------------------------------------------------------------------ */
+
+static JSValue j5_internalize(JSContext *ctx, JSValueConst holder,
+                              JSValueConst key, JSValue val,
+                              JSValueConst reviver, int depth)
+{
+    JSValue args[2];
+
+    if (depth > J5_MAX_DEPTH) {
+        JS_FreeValue(ctx, val);
+        return JS_ThrowSyntaxError(ctx, "JSON5: nesting too deep");
+    }
+
+    if (JS_IsObject(val)) {
+        if (JS_IsArray(ctx, val)) {
+            JSValue len_val = JS_GetPropertyStr(ctx, val, "length");
+            uint32_t len = 0;
+            uint32_t i;
+            if (JS_IsException(len_val)) {
+                JS_FreeValue(ctx, val);
+                return JS_EXCEPTION;
+            }
+            if (JS_ToUint32(ctx, &len, len_val)) {
+                JS_FreeValue(ctx, len_val);
+                JS_FreeValue(ctx, val);
+                return JS_EXCEPTION;
+            }
+            JS_FreeValue(ctx, len_val);
+            for (i = 0; i < len; i++) {
+                JSValue child = JS_GetPropertyUint32(ctx, val, i);
+                JSValue new_val, keyv;
+                char keybuf[16];
+                if (JS_IsException(child)) {
+                    JS_FreeValue(ctx, val);
+                    return JS_EXCEPTION;
+                }
+                snprintf(keybuf, sizeof(keybuf), "%u", (unsigned)i);
+                keyv = JS_NewString(ctx, keybuf);
+                if (JS_IsException(keyv)) {
+                    JS_FreeValue(ctx, child);
+                    JS_FreeValue(ctx, val);
+                    return JS_EXCEPTION;
+                }
+                new_val = j5_internalize(ctx, val, keyv, child,
+                                         reviver, depth + 1);
+                JS_FreeValue(ctx, keyv);
+                if (JS_IsException(new_val)) {
+                    JS_FreeValue(ctx, val);
+                    return JS_EXCEPTION;
+                }
+                if (JS_IsUndefined(new_val)) {
+                    JSAtom atom = JS_NewAtomUInt32(ctx, i);
+                    if (atom == JS_ATOM_NULL) {
+                        JS_FreeValue(ctx, new_val);
+                        JS_FreeValue(ctx, val);
+                        return JS_EXCEPTION;
+                    }
+                    JS_DeleteProperty(ctx, val, atom, 0);
+                    JS_FreeAtom(ctx, atom);
+                    JS_FreeValue(ctx, new_val);
+                } else if (JS_SetPropertyUint32(ctx, val, i, new_val) < 0) {
+                    JS_FreeValue(ctx, val);
+                    return JS_EXCEPTION;
+                }
+            }
+        } else {
+            JSPropertyEnum *tab = NULL;
+            uint32_t len = 0, i;
+            if (JS_GetOwnPropertyNames(ctx, &tab, &len, val,
+                                       JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
+                JS_FreeValue(ctx, val);
+                return JS_EXCEPTION;
+            }
+            for (i = 0; i < len; i++) {
+                JSValue child, new_val, keyv;
+                child = JS_GetProperty(ctx, val, tab[i].atom);
+                if (JS_IsException(child)) {
+                    JS_FreePropertyEnum(ctx, tab, len);
+                    JS_FreeValue(ctx, val);
+                    return JS_EXCEPTION;
+                }
+                keyv = JS_AtomToString(ctx, tab[i].atom);
+                if (JS_IsException(keyv)) {
+                    JS_FreeValue(ctx, child);
+                    JS_FreePropertyEnum(ctx, tab, len);
+                    JS_FreeValue(ctx, val);
+                    return JS_EXCEPTION;
+                }
+                new_val = j5_internalize(ctx, val, keyv, child,
+                                         reviver, depth + 1);
+                JS_FreeValue(ctx, keyv);
+                if (JS_IsException(new_val)) {
+                    JS_FreePropertyEnum(ctx, tab, len);
+                    JS_FreeValue(ctx, val);
+                    return JS_EXCEPTION;
+                }
+                if (JS_IsUndefined(new_val)) {
+                    JS_DeleteProperty(ctx, val, tab[i].atom, 0);
+                    JS_FreeValue(ctx, new_val);
+                } else if (JS_SetProperty(ctx, val, tab[i].atom, new_val) < 0) {
+                    JS_FreePropertyEnum(ctx, tab, len);
+                    JS_FreeValue(ctx, val);
+                    return JS_EXCEPTION;
+                }
+            }
+            JS_FreePropertyEnum(ctx, tab, len);
+        }
+    }
+
+    if (!JS_IsFunction(ctx, reviver)) {
+        return val;
+    }
+
+    args[0] = JS_DupValue(ctx, key);
+    args[1] = val;
+    {
+        JSValue ret = JS_Call(ctx, reviver, holder, 2, args);
+        JS_FreeValue(ctx, args[0]);
+        JS_FreeValue(ctx, val);
+        return ret;
+    }
+}
 
 static JSValue js_json5_parse(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
     const char *text;
     size_t len;
-    J5Parser s;
+    J5Parser p;
     JSValue val;
 
     if (argc < 1)
@@ -669,77 +436,94 @@ static JSValue js_json5_parse(JSContext *ctx, JSValueConst this_val,
     if (!text)
         return JS_EXCEPTION;
 
-    s.ctx = ctx;
-    s.start = text;
-    s.p = text;
-    s.end = text + len;
+    memset(&p, 0, sizeof(p));
+    p.ctx = ctx;
+    pdjson_open_null(&p.stream);
+    pdjson_set_allocator(&p.stream, &j5_allocator, ctx);
+    pdjson_set_language(&p.stream, PDJSON_LANGUAGE_JSON5);
+    pdjson_reopen_buffer(&p.stream, text, len);
 
-    if (j5_skip_ws_comments(&s)) {
-        JS_FreeCString(ctx, text);
-        return JS_EXCEPTION;
-    }
-    val = j5_parse_value(&s, 0);
+    val = j5_parse_value(&p, 0);
     if (!JS_IsException(val)) {
-        if (j5_skip_ws_comments(&s)) {
+        /* 顶层值之后只允许空白；libpdjson5 非流式模式下多值/尾随垃圾报错 */
+        enum pdjson_type t = pdjson_next(&p.stream);
+        if (t != PDJSON_DONE) {
             JS_FreeValue(ctx, val);
-            val = JS_EXCEPTION;
-        } else if (s.p != s.end) {
-            j5_syntax(&s, "unexpected trailing characters");
-            JS_FreeValue(ctx, val);
-            val = JS_EXCEPTION;
+            val = t == PDJSON_ERROR ? j5_throw_parse_error(&p)
+                                    : JS_ThrowSyntaxError(ctx,
+                                          "JSON5: unexpected trailing characters");
         }
     }
+
+    pdjson_close(&p.stream);
     JS_FreeCString(ctx, text);
+
+    if (JS_IsException(val))
+        return val;
+
+    /* reviver：包一层 {"": value}，按 JSON.parse 语义自底向上转换 */
+    if (argc >= 2 && JS_IsFunction(ctx, argv[1])) {
+        JSValue root, keyv, holder_val, out;
+        root = JS_NewObject(ctx);
+        if (JS_IsException(root)) {
+            JS_FreeValue(ctx, val);
+            return JS_EXCEPTION;
+        }
+        keyv = JS_NewString(ctx, "");
+        if (JS_IsException(keyv)) {
+            JS_FreeValue(ctx, root);
+            JS_FreeValue(ctx, val);
+            return JS_EXCEPTION;
+        }
+        holder_val = JS_DupValue(ctx, val);
+        if (JS_DefinePropertyValueStr(ctx, root, "",
+                                      val, JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, holder_val);
+            JS_FreeValue(ctx, keyv);
+            JS_FreeValue(ctx, root);
+            return JS_EXCEPTION;
+        }
+        out = j5_internalize(ctx, root, keyv, holder_val, argv[1], 0);
+        JS_FreeValue(ctx, keyv);
+        JS_FreeValue(ctx, root);
+        return out;
+    }
     return val;
 }
 
-/* stringify 复用 JSON.stringify：JSON 输出本身就是合法 JSON5。 */
-static JSValue js_json5_stringify(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv)
-{
-    JSValue global, json, fn, ret;
-
-    global = JS_GetGlobalObject(ctx);
-    if (JS_IsException(global))
-        return JS_EXCEPTION;
-    json = JS_GetPropertyStr(ctx, global, "JSON");
-    JS_FreeValue(ctx, global);
-    if (JS_IsException(json))
-        return JS_EXCEPTION;
-    fn = JS_GetPropertyStr(ctx, json, "stringify");
-    if (JS_IsException(fn)) {
-        JS_FreeValue(ctx, json);
-        return JS_EXCEPTION;
-    }
-    if (JS_IsFunction(ctx, fn)) {
-        ret = JS_Call(ctx, fn, json, argc, argv);
-    } else {
-        JS_FreeValue(ctx, fn);
-        JS_FreeValue(ctx, json);
-        return JS_ThrowTypeError(ctx, "JSON.stringify is not available");
-    }
-    JS_FreeValue(ctx, fn);
-    JS_FreeValue(ctx, json);
-    return ret;
-}
+/* ------------------------------------------------------------------ */
+/* 注册                                                                */
+/* ------------------------------------------------------------------ */
 
 static const JSCFunctionListEntry js_json5_funcs[] = {
-    JS_CFUNC_DEF("parse", 1, js_json5_parse),
-    JS_CFUNC_DEF("stringify", 3, js_json5_stringify),
+    JS_CFUNC_DEF("parse", 2, js_json5_parse),
 };
 
-/*
- * 注册全局 JSON5 对象。
- * 由 quickjs_ext.cpp 在 QJS_ENABLE_JSON5 打开时调用。
- * 返回 0 成功、-1 失败（异常已挂到 ctx）。
- */
 int qjs_json5_init(JSContext *ctx, JSValueConst global_obj)
 {
-    JSValue obj = JS_NewObject(ctx);
+    JSValue obj, stringify;
+
+    obj = JS_NewObject(ctx);
     if (JS_IsException(obj))
         return -1;
+
     JS_SetPropertyFunctionList(ctx, obj, js_json5_funcs,
                                countof(js_json5_funcs));
+
+    /* 注入官方 json5 stringify 算法（IIFE 返回函数） */
+    stringify = JS_Eval(ctx, qjs_json5_stringify_js,
+                        strlen(qjs_json5_stringify_js),
+                        "<json5-stringify>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(stringify)) {
+        JS_FreeValue(ctx, obj);
+        return -1;
+    }
+    if (JS_SetPropertyStr(ctx, obj, "stringify", stringify) < 0) {
+        JS_FreeValue(ctx, obj);
+        return -1;
+    }
+    JS_SetPropertyStr(ctx, obj, "version", JS_NewString(ctx, "2.2.3"));
+
     if (JS_SetPropertyStr(ctx, global_obj, "JSON5", obj) < 0)
         return -1;
     return 0;

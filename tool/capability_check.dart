@@ -332,11 +332,14 @@ const _syncChecks = r'''
     const o = JSON5.parse(`
 // comment
 {a: 'x', b: [1, 2,], hex: 0x10, inf: Infinity}
-`);
-    if (o.a !== 'x' || o.b.length !== 2 || o.hex !== 16 || o.inf !== Infinity)
-      throw new Error('bad parse');
-    if (typeof JSON5.stringify(o) !== 'string') throw new Error('bad stringify');
-    return 'parse（注释/裸键/尾逗号/十六进制/Infinity）+ stringify';
+`, (k, v) => typeof v === 'number' ? v + 1 : v);
+    if (o.a !== 'x' || o.b.length !== 2 || o.hex !== 17 || o.inf !== Infinity)
+      throw new Error('bad parse/reviver');
+    const s = JSON5.stringify(o);
+    if (s !== "{a:'x',b:[2,3],hex:17,inf:Infinity}")
+      throw new Error('bad stringify: ' + s);
+    if (JSON5.parse(s).hex !== 17) throw new Error('bad roundtrip');
+    return 'parse(reviver) + 官方风格 stringify';
   });
 
   return r;

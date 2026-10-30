@@ -549,13 +549,96 @@ line2',
     expect(v['escaped'], 'A中');
   }, skip: json5Available ? null : 'so 未启用 QJS_ENABLE_JSON5（编译期开关）');
 
-  test('JSON5.stringify 输出可被 JSON.parse 回读', () {
-    final s = engine.evaluate(
-        'JSON5.stringify({a: 1, b: [true, null], c: "x"})') as String;
-    final back = engine.evaluate('JSON.parse(${jsonEncode(s)})') as Map;
+  test('JSON5.stringify：官方风格（裸键/单引号/尾逗号/space/quote/replacer）', () {
+    final v = engine.evaluate(r'''
+(() => ({
+  plain: JSON5.stringify({a: 1, b: [true, null], c: "x"}),
+  pretty: JSON5.stringify({a: 1, b: [1, 2]}, null, 2),
+  doubleQuote: JSON5.stringify({a: "it's"}, {quote: '"'}),
+  list: JSON5.stringify({a: 1, b: 2}, ['b']),
+  fn: JSON5.stringify({a: 1, b: 2}, (k, v) => typeof v === 'number' ? v * 2 : v),
+  omit: JSON5.stringify({a: 1, f() {}, u: undefined, arr: [1, , 3]}),
+}))()
+''') as Map;
+    expect(v['plain'], "{a:1,b:[true,null],c:'x'}");
+    expect(v['pretty'], '{\n  a: 1,\n  b: [\n    1,\n    2,\n  ],\n}');
+    expect(v['doubleQuote'], '{a:"it\'s"}');
+    expect(v['list'], '{b:2}');
+    expect(v['fn'], '{a:2,b:4}');
+    expect(v['omit'], '{a:1,arr:[1,null,3]}');
+  }, skip: json5Available ? null : 'so 未启用 QJS_ENABLE_JSON5（编译期开关）');
+
+  test('JSON5.stringify 回读 + toJSON/toJSON5 + 循环/BigInt 报错', () {
+    final v = engine.evaluate(r'''
+(() => {
+  const src = {a: 1, b: [true, null], c: 'x'};
+  const back = JSON5.parse(JSON5.stringify(src));
+  const withToJson = JSON5.stringify({d: new Date(0)});
+  const withToJson5 = JSON5.stringify({d: {toJSON5: () => 'v5'}});
+  let circular = '';
+  try { const o = {}; o.self = o; JSON5.stringify(o); }
+  catch (e) { circular = e.name; }
+  let big = '';
+  try { JSON5.stringify(1n); } catch (e) { big = e.name; }
+  return {back, withToJson, withToJson5, circular, big};
+})()
+''') as Map;
+    final back = v['back'] as Map;
     expect(back['a'], 1);
     expect(back['b'], [true, null]);
     expect(back['c'], 'x');
+    expect(v['withToJson'], '{d:\'1970-01-01T00:00:00.000Z\'}');
+    expect(v['withToJson5'], '{d:\'v5\'}');
+    expect(v['circular'], 'TypeError');
+    expect(v['big'], 'TypeError');
+  }, skip: json5Available ? null : 'so 未启用 QJS_ENABLE_JSON5（编译期开关）');
+
+  test('JSON5.parse：reviver 与转义/代理对/内嵌 NUL/Unicode 空白', () {
+    final v = engine.evaluate(r'''
+(() => {
+  const revived = JSON5.parse('{a:1,b:{c:2},d:[3,4]}', (k, v) =>
+    typeof v === 'number' ? v * 10 : v);
+  const emoji = JSON5.parse("'\\uD83D\\uDE00'");
+  const nul = JSON5.parse("'a\\x00b'");
+  const ws = JSON5.parse('\uFEFF\u00A0 {x: 1}');
+  return {
+    revived,
+    emoji,
+    nulLen: nul.length,
+    nulCode: nul.charCodeAt(1),
+    ws: ws.x,
+  };
+})()
+''') as Map;
+    final revived = v['revived'] as Map;
+    expect((revived['a']), 10);
+    expect(((revived['b'] as Map)['c']), 20);
+    expect((revived['d'] as List), [30, 40]);
+    expect(v['emoji'], '😀');
+    expect(v['nulLen'], 3);
+    expect(v['nulCode'], 0);
+    expect(v['ws'], 1);
+  }, skip: json5Available ? null : 'so 未启用 QJS_ENABLE_JSON5（编译期开关）');
+
+  test('JSON5.parse：官方语法边界（重复键/带符号十六进制/顶层标量）', () {
+    final v = engine.evaluate(r'''
+(() => ({
+  dup: JSON5.parse('{a:1,a:2}').a,
+  signedHex: JSON5.parse('-0x10'),
+  plusHex: JSON5.parse('+0x10'),
+  zero: JSON5.parse('0'),
+  negInf: JSON5.parse('-Infinity'),
+  topString: JSON5.parse("'top'"),
+  commentTail: JSON5.parse('[1] // tail'),
+}))()
+''') as Map;
+    expect(v['dup'], 2);
+    expect(v['signedHex'], -16);
+    expect(v['plusHex'], 16);
+    expect(v['zero'], 0);
+    expect(v['negInf'], double.negativeInfinity);
+    expect(v['topString'], 'top');
+    expect(v['commentTail'], [1]);
   }, skip: json5Available ? null : 'so 未启用 QJS_ENABLE_JSON5（编译期开关）');
 
   test('__proto__ 作为普通自有属性，不污染原型', () {

@@ -38,24 +38,37 @@ CMake 用 `file(GLOB modules/*.c)` 收集源文件，所以新增插件**默认�
 ## JSON5 插件
 
 - 开关：`-DQJS_ENABLE_JSON5=ON`（默认 OFF，适合做“按需裁剪二进制”的实验）；
-- 全局对象：`JSON5`，API：
-  - `JSON5.parse(text)` — 返回解析结果；
-  - `JSON5.stringify(value[, replacer[, space]])` — 复用 `JSON.stringify`
-    （JSON 输出本身是合法 JSON5，暂不生成裸键/单引号风格）；
+- 全局对象：`JSON5`，与官方 [json5](https://json5.org/) 包语义对齐：
+  - `JSON5.parse(text[, reviver])` — 完整 JSON5 语法 + reviver（自底向上，
+    返回 `undefined` 删除属性）；
+  - `JSON5.stringify(value[, replacer[, space]])` — 官方风格输出（裸键、
+    单/双引号自动选择、尾逗号、`space` 缩进、`quote` 选项、replacer
+    函数/数组、`toJSON5`/`toJSON`、循环检测、BigInt 抛 TypeError）；
+  - `JSON5.version` = `2.2.3`。
+- 实现：
+  - **parse**：vendored [libpdjson5](https://github.com/boris-kolpackov/libpdjson5)
+    （Unlicense，事件流解析器；完整 JSON5 语法、UTF-8/代理对/内嵌 NUL），
+    本仓 `qjs_json5.c` 把事件流组装成 JSValue；
+  - **stringify**：官方 json5 的 stringify 算法（MIT，Aseem Kishore 等），
+    作为插件注入的 JS 助手（`qjs_json5_stringify.js`），仅把 Unicode
+    标识符判断换成 `\p{ID_Start}`/`\p{ID_Continue}`。
 - 覆盖语法：行/块注释、裸键、单/双引号、尾逗号、十六进制、`+`/`-`、
   `Infinity`/`NaN`、前导/尾随小数点、指数、续行与跨行字符串、
   `\x`/`\u` 转义与代理对、NBSP/BOM/U+2028/U+2029 空白；
-- 限制：`parse` 暂不支持 `reviver`；`stringify` 不复刻 JSON5 风格化输出；
+- 与官方的已知差异：Unicode 空白识别使用上游 libpdjson5 的“常见 Zs 子集”
+  （NBSP/BOM/U+2028/U+2029 已覆盖）；`stringify` 对 BigInt 抛错、不输出
+  JSON5 未定义的扩展类型，与官方一致；
 - 测试：`test/engine_test.dart` 的 “JSON5 插件（可选全局能力）” 组；
-  未启用时自动 skip，启用后跑完整用例（含 `__proto__` 不污染原型）。
+  未启用时自动 skip，启用后跑完整用例（语法矩阵、reviver、stringify
+  选项、循环/BigInt、`__proto__` 不污染原型）。
 
 ## 已验证的两种产物
 
 同一个 CMake 构建目录切换开关即可：
 
 ```sh
-cmake -S . -B build/x -DQJS_ENABLE_JSON5=OFF   # 默认：无 JSON5，66 测试 4 skip
-cmake -S . -B build/x -DQJS_ENABLE_JSON5=ON    # 注入 JSON5，70 测试全跑
+cmake -S . -B build/x -DQJS_ENABLE_JSON5=OFF   # 默认：无 JSON5，66 测试 7 skip
+cmake -S . -B build/x -DQJS_ENABLE_JSON5=ON    # 注入 JSON5，73 测试全跑
 cmake --build build/x
 ```
 

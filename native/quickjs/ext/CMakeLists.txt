@@ -58,7 +58,11 @@ file(GLOB EXT_MODULES_SRC
 option(QJS_ENABLE_JSON5 "注入全局 JSON5 扩展（JSON5.parse/stringify）" OFF)
 if(QJS_ENABLE_JSON5)
     add_compile_definitions(QJS_ENABLE_JSON5=1)
-    message(STATUS "qjs_engine: JSON5 全局插件已启用")
+    # JSON5 parser 后端：vendored libpdjson5（Unlicense，完整 JSON5 语法）
+    list(APPEND EXT_MODULES_SRC
+        ${EXT_DIR}/third_party/libpdjson5/pdjson5.c
+    )
+    message(STATUS "qjs_engine: JSON5 全局插件已启用（libpdjson5 ${EXT_DIR}/third_party）")
 else()
     list(FILTER EXT_MODULES_SRC EXCLUDE REGEX "qjs_json5\\.c$")
     message(STATUS "qjs_engine: JSON5 全局插件未启用（-DQJS_ENABLE_JSON5=ON 可开启）")

@@ -24,4 +24,6 @@ SOFTWARE.
 
 Third-party components bundled under native/ retain their own licenses
 (QuickJS: MIT; BoringSSL: OpenSSL + ISC; lexbor: Apache-2.0; sqlite3: Public
-Domain; zlib: zlib; wasm3: MIT). See native/quickjs/ext/*/LICENSE for details.
+Domain; zlib: zlib; wasm3: MIT; libpdjson5: Unlicense; json5 stringify: MIT).
+See native/quickjs/ext/*/LICENSE, native/quickjs/ext/third_party/*, and
+native/quickjs/ext/modules/qjs_json5_stringify.js for details.
