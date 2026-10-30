@@ -209,6 +209,15 @@ engine.runGC();
 双模式交叉验证）——绑定层的错误只有真实加载才暴露得出来。库路径经环境变量
 `QJS_ULTRA_LIB` 指定，未设回落 `native/<平台>/<arch>/`；缺库时整组跳过并说明原因。
 
+完整能力矩阵（cheerio/URL/TextCodec/Buffer/crypto/fs/zlib/SQLite/wasm/
+timers/JSON5 可选插件等）可一条命令自检并输出表格：
+
+```sh
+dart run tool/capability_check.dart [动态库路径]
+```
+
+JSON5 未编译时显示 SKIP；有失败项时退出码为 1（可直接接 CI）。
+
 ## 构建（维护者）
 
 引擎 so 由本仓 CI 出包：push 到 `main`（源码/构建链路径）自动构建四架构并发

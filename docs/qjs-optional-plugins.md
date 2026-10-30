@@ -59,5 +59,15 @@ cmake -S . -B build/x -DQJS_ENABLE_JSON5=ON    # 注入 JSON5，70 测试全跑
 cmake --build build/x
 ```
 
+## 一条命令看完整能力矩阵
+
+```sh
+dart run tool/capability_check.dart [动态库路径]
+```
+
+脚本会真实加载 so/dll，逐项验证 §23 全部全局能力（cheerio/URL/TextCodec/
+Buffer/crypto/fs/zlib/SQLite/wasm/timers/JSON5…），输出 OK/FAIL/SKIP 表格；
+JSON5 未编译时显示 SKIP，有 FAIL 时退出码 1。CI 的 dart-check job 也会跑它。
+
 新增可选插件时复制这套四步即可；已注册的必选插件（cheerio/URL/TextCodec 等）
 不受影响。

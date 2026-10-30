@@ -292,6 +292,9 @@ jobs:
       - name: Engine tests（真实加载 dll）
         run: dart test --reporter expanded
 
+      - name: Capability self-check（能力矩阵）
+        run: dart run tool/capability_check.dart
+
   # 汇总发布：把四个架构的 .so 合成一份 Release（含校验和与构建信息）
   #
   # 触发条件：push 到 main（已由 on.push.paths 过滤为源码/构建链改动）自动发布；
