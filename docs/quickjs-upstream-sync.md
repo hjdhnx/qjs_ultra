@@ -5,17 +5,20 @@
 
 ## 当前基线
 
-- **官方版本：2026-06-04**（当前最新正式 release，与 `native/quickjs/VERSION.txt` 一致）
-- 该版本相对 2025-09-13 **bench-v8 快 42%**（小对象 custom malloc + 微优化），
-  这部分性能已经在本仓生效。
-- 本地补丁只改 3 个文件，共约 720 行（`diff` 统计 +607/−2）：
+- **已同步官方 master 提交 `19d6bd8`（2026-10-26）**，版本标记见
+  `native/quickjs/VERSION.txt`（`2026-06-04+master-19d6bd8`）。
+- 2026-06-04 正式版相对 2025-09-13 **bench-v8 快 42%**（小对象 custom malloc +
+  微优化）；master 在此之上再叠加了比较运算内联、`Array.slice/splice`、
+  `String.concat` 等性能提交与一批修复。
+- 本地补丁只改 3 个文件，共约 720 行（相对 2026-06-04 release 的 diff）：
   - `quickjs.c`：`JSRuntime.ext_data` / `JSContext` 回调槽、`JS_NewContext` 末尾
     `qjs_ext_install_all()`、`JS_FreeRuntime` 的 `qjs_ext_free()`、atob/btoa /
     performance intrinsic、`JS_NewUint8ArrayCopy` 等；
   - `quickjs.h`：上述 API 声明；
   - `cutils.h`：少量跨平台辅助声明。
-- 其余核心文件（quickjs-libc、cutils.c、dtoa、libregexp、libunicode 等）与
-  官方 2026-06-04 逐字节一致；`ext/` 为本仓扩展与第三方 vendored 代码。
+- 其余核心文件（quickjs-libc、cutils.c、dtoa、libregexp、libunicode 等）跟随
+  官方 master；`ext/` 为本仓扩展与第三方 vendored 代码。
+- Temporal/Intl 按阶段一策略关闭（未引入 `intl/`、`temporal/` 目录）。
 
 ## 上游 2026-06-04 之后的现状（2026-10-30 检查）
 
@@ -136,3 +139,12 @@ git -C /tmp/qjs-master apply --3way /tmp/local_qjs.patch
   cherry-pick 顺序与依赖需逐个确认。
 - 任何对 `native/quickjs/` 的改动都应在 commit message 中注明来源 commit 与
   验证方式（本仓约定）。
+
+## 完成记录（2026-10-30）
+
+- 阶段一已执行：同步 `19d6bd8`，提交 `862afa1`，已合入 `main`；
+- 本地补丁全部保留，唯一适配为 `js_create_from_ctor` → `JS_CreateFromConstructor`；
+- 验证：本地 MinGW Release 完整构建 + `dart test` 60 用例全过；CI 四架构
+  （arm64-v8a / armeabi-v7a / x86 / x86_64）+ Windows DLL + Dart 测试全绿；
+- 产物 Release：`build-20261030-862afa1`；
+- 下次官方发版后重复本流程；启用 Temporal/Intl 时按“阶段二”接入。
