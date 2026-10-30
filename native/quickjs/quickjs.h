@@ -394,6 +394,20 @@ JSRuntime *JS_GetRuntime(JSContext *ctx);
 void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj);
 JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id);
 
+enum {
+    JS_INTL_CTOR_NUMBERFORMAT = 0,
+    JS_INTL_CTOR_DATETIMEFORMAT,
+    JS_INTL_CTOR_COLLATOR,
+    JS_INTL_CTOR_LISTFORMAT,
+    JS_INTL_CTOR_LOCALE,
+    JS_INTL_CTOR_DURATIONFORMAT,
+    JS_INTL_FALLBACK_SYMBOL,
+    JS_CONTEXT_VALUE_COUNT,
+};
+
+void JS_SetContextValue(JSContext *ctx, int idx, JSValue val);
+JSValue JS_GetContextValue(JSContext *ctx, int idx);
+
 /* the following functions are used to select the intrinsic object to
    save memory */
 JSContext *JS_NewContextRaw(JSRuntime *rt);
@@ -409,6 +423,10 @@ int JS_AddIntrinsicMapSet(JSContext *ctx);
 int JS_AddIntrinsicTypedArrays(JSContext *ctx);
 int JS_AddIntrinsicPromise(JSContext *ctx);
 int JS_AddIntrinsicWeakRef(JSContext *ctx);
+#ifdef CONFIG_TEMPORAL_INTL
+int JS_AddIntrinsicTemporal(JSContext *ctx);
+int JS_AddIntrinsicIntl(JSContext *ctx);
+#endif
 
 /* ---- 项目自定义 intrinsic 函数 (backport from 2025 project) ---- */
 /* 注册全局 atob/btoa 函数（Base64 编解码） */
@@ -732,12 +750,18 @@ JS_BOOL JS_StrictEq(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 JS_BOOL JS_SameValue(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 JS_BOOL JS_SameValueZero(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 
+JSValue JS_ToObject(JSContext *ctx, JSValueConst val);
+#define JS_HINT_STRING  0
+#define JS_HINT_NUMBER  1
+#define JS_HINT_NONE    2
+JSValue JS_ToPrimitive(JSContext *ctx, JSValueConst val, int hint);
 int JS_ToBool(JSContext *ctx, JSValueConst val); /* return -1 for JS_EXCEPTION */
 int JS_ToInt32(JSContext *ctx, int32_t *pres, JSValueConst val);
 static inline int JS_ToUint32(JSContext *ctx, uint32_t *pres, JSValueConst val)
 {
     return JS_ToInt32(ctx, (int32_t*)pres, val);
 }
+int JS_ToInt32Sat(JSContext *ctx, int *pres, JSValueConst val);
 int JS_ToInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
 int JS_ToIndex(JSContext *ctx, uint64_t *plen, JSValueConst val);
 int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val);
@@ -745,6 +769,9 @@ int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val);
 int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
 /* same as JS_ToInt64() but allow BigInt */
 int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val);
+JSValue JS_NewBigInt128(JSContext *ctx, uint64_t low, uint64_t high);
+int JS_ToBigInt128(JSContext *ctx, uint64_t *plow, uint64_t *phigh, JSValueConst val);
+int JS_ToBigInt128Sat(JSContext *ctx, uint64_t *plow, uint64_t *phigh, JSValueConst val);
 
 JSValue JS_NewStringLen(JSContext *ctx, const char *str1, size_t len1);
 static inline JSValue JS_NewString(JSContext *ctx, const char *str)
@@ -763,12 +790,18 @@ static inline const char *JS_ToCString(JSContext *ctx, JSValueConst val1)
 {
     return JS_ToCStringLen2(ctx, NULL, val1, 0);
 }
+const char *JS_ToCStringNZ(JSContext *ctx, JSValueConst val1);
 void JS_FreeCString(JSContext *ctx, const char *ptr);
+int JS_ToUTF32String(JSContext *ctx, uint32_t **pbuf, JSValueConst val);
+
+JSValue JS_NewSymbol(JSContext *ctx, const char *description, JS_BOOL is_global);
 
 JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto, JSClassID class_id);
 JSValue JS_NewObjectClass(JSContext *ctx, int class_id);
 JSValue JS_NewObjectProto(JSContext *ctx, JSValueConst proto);
 JSValue JS_NewObject(JSContext *ctx);
+JSValue JS_CreateFromConstructor(JSContext *ctx, JSValueConst ctor, 
+                                 int class_id);
 
 JS_BOOL JS_IsFunction(JSContext* ctx, JSValueConst val);
 JS_BOOL JS_IsConstructor(JSContext* ctx, JSValueConst val);
@@ -778,6 +811,7 @@ JSValue JS_NewArray(JSContext *ctx);
 int JS_IsArray(JSContext *ctx, JSValueConst val);
 
 JSValue JS_NewDate(JSContext *ctx, double epoch_ms);
+int JS_ThisDateValue(JSContext *ctx, double *valp, JSValueConst this_val);
 
 JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                JSAtom prop, JSValueConst receiver,
@@ -846,6 +880,8 @@ JSValue JS_EvalThis(JSContext *ctx, JSValueConst this_obj,
                     const char *input, size_t input_len,
                     const char *filename, int eval_flags);
 JSValue JS_GetGlobalObject(JSContext *ctx);
+int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
+                            JSValueConst obj);
 int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
 int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                       JSAtom prop, JSValueConst val,
@@ -910,7 +946,10 @@ typedef struct {
 } JSSharedArrayBufferFunctions;
 void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
                                       const JSSharedArrayBufferFunctions *sf);
-
+int64_t JS_AtomicsPollWaiters(JSContext *ctx);
+typedef void JS_AtomicsAsyncWaker(JSRuntime *rt, void *opaque);
+void JS_AtomicsSetAsyncWaker(JS_AtomicsAsyncWaker *cb, void *opaque);
+                             
 typedef enum JSPromiseStateEnum {
     JS_PROMISE_PENDING,
     JS_PROMISE_FULFILLED,
@@ -1021,6 +1060,7 @@ typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
     JS_CFUNC_constructor_magic,
     JS_CFUNC_constructor_or_func,
     JS_CFUNC_constructor_or_func_magic,
+    JS_CFUNC_constructor_or_func_flags,
     JS_CFUNC_f_f,
     JS_CFUNC_f_f_f,
     JS_CFUNC_getter,
@@ -1036,6 +1076,7 @@ typedef union JSCFunctionType {
     JSCFunction *constructor;
     JSValue (*constructor_magic)(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
     JSCFunction *constructor_or_func;
+    JSValue (*constructor_or_func_flags)(JSContext *ctx, JSValueConst func_obj, JSValueConst this_val, int argc, JSValueConst *argv, int flags);
     double (*f_f)(double);
     double (*f_f_f)(double, double);
     JSValue (*getter)(JSContext *ctx, JSValueConst this_val);
@@ -1137,6 +1178,37 @@ int JS_SetPropertyFunctionList(JSContext *ctx, JSValueConst obj,
                                const JSCFunctionListEntry *tab,
                                int len);
 
+#define JS_NEW_CTOR_NO_GLOBAL   (1 << 0) /* don't create a global binding */
+#define JS_NEW_CTOR_PROTO_CLASS (1 << 1) /* the prototype class is 'class_id' instead of JS_CLASS_OBJECT */
+#define JS_NEW_CTOR_PROTO_EXIST (1 << 2) /* the prototype is already defined */
+#define JS_NEW_CTOR_READONLY    (1 << 3) /* read-only constructor field */
+
+JSValue JS_NewCConstructor(JSContext *ctx, int class_id, const char *name,
+                           JSCFunction *func, int length, JSCFunctionEnum cproto, int magic,
+                           JSValueConst parent_ctor,
+                           const JSCFunctionListEntry *ctor_fields, int n_ctor_fields,
+                           const JSCFunctionListEntry *proto_fields, int n_proto_fields,
+                           int flags);
+
+/* iterator helpers */
+
+JSValue JS_GetIterator(JSContext *ctx, JSValueConst obj, JS_BOOL is_async);
+JSValue JS_IteratorNext(JSContext *ctx, JSValueConst enum_obj,
+                        JSValueConst method, JS_BOOL *pdone);
+int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
+                     JS_BOOL is_exception_pending);
+
+#ifdef CONFIG_TEMPORAL_INTL
+/*
+ * Internal string helpers: caller must ensure 'val' is a JS_TAG_STRING
+ * (use JS_ToString() which never returns a rope). We may later export
+ * an opaque struct JSString and use it as parameter instead.
+ */
+int js_string_get_len(JSValueConst val);
+int js_string_getc(JSValueConst val, int *pidx);
+JSValue js_sub_string_val(JSContext *ctx, JSValueConst val, int start, int end);
+#endif /* CONFIG_TEMPORAL_INTL */
+
 /* C module definition */
 
 typedef int JSModuleInitFunc(JSContext *ctx, JSModuleDef *m);
@@ -1156,6 +1228,21 @@ int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
 int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);
 JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m);
                         
+/* locale specific callbacks to override the default functions */
+typedef struct JSLocaleCallbacks {
+    JSValue (*number_toLocaleString)(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv);
+    JSValue (*date_toLocaleString)(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv, int part);
+    JSValue (*string_localeCompare)(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv);
+    JSValue (*bigint_toLocaleString)(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv);
+    int (*get_string_locale_lang)(JSContext *ctx, int argc, JSValueConst *argv);
+} JSLocaleCallbacks;
+
+void JS_SetLocaleCallbacks(JSContext *ctx, const JSLocaleCallbacks *callbacks);
+
 /* debug value output */
 
 typedef struct {
