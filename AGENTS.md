@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 仓库定位
 
-产出 Android 四架构的 `libquickjs_bridge.so`，供 DsPlayer 的「QJS 引擎插件」跨包 dlopen，执行 TVBox/drpy2 生态的 `.js` 爬虫源。引擎派生自 [AAswordman/Operit](https://github.com/AAswordman/Operit) 的 QuickJS。
+产出 Android 四架构的 `libquickjs_bridge.so`，供 DsPlayer 的「QJS 引擎插件」跨包 dlopen，执行 TVBox/drpy2 生态的 `.js` 爬虫源。引擎基于 [QuickJS](https://bellard.org/quickjs/) 官方源码（MIT）改造：Android/嵌入式适配 + C 扩展模块 + Dart FFI 桥。
 
 **改动范围纪律**：本仓唯一自维护文件是 `bridge/quickjs_bridge.c`（对外 C API + DsPlayer 补丁）。`native/` 下全部是引擎与第三方 vendored 源码（quickjs 核心、boringssl、lexbor、sqlite3、zlib、wasm3）——改它们等于改上游，需格外谨慎并在 commit message 说明原因。
 

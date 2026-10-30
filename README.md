@@ -249,7 +249,8 @@ abi/exports.txt                    # 导出符号基线（ABI 唯一事实源）
 
 ## 许可
 
-仓根 `LICENSE` 为 GPL-3.0（继承自上游
-[AAswordman/Operit](https://github.com/AAswordman/Operit)）。第三方组件各自遵循
-原始许可：QuickJS（MIT）、BoringSSL（OpenSSL + ISC）、lexbor（Apache-2.0）、
+本仓采用 **MIT** 协议（见仓根 `LICENSE`）。引擎核心基于
+[QuickJS](https://bellard.org/quickjs/) 官方源码（Fabrice Bellard / Charlie
+Gordon，MIT）改造，本项目补充 Android/嵌入式平台适配、C 扩展模块与 Dart FFI 桥。
+第三方组件各自遵循原始许可：BoringSSL（OpenSSL + ISC）、lexbor（Apache-2.0）、
 sqlite3（Public Domain）、zlib（zlib）、wasm3（MIT）。
