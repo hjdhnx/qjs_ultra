@@ -458,13 +458,23 @@ group('文档能力对齐', () {
     expect(engine.evaluate('typeof clearInterval'), 'function');
   });
 
+  test('setTimeout 回调 settle 前台 await 链', () async {
+    final v = await engine
+        .evaluateAsync('new Promise((r) => setTimeout(() => r(7), 5))');
+    expect(v, 7);
+  });
+
   test('setInterval 周期回调 + clearInterval 停止', () async {
-    engine.evaluate('globalThis.__ticks = 0;'
-        'globalThis.__iv = setInterval(() => { globalThis.__ticks++; }, 5);');
-    await Future<void>.delayed(const Duration(milliseconds: 60));
-    final ticks =
-        engine.evaluate('clearInterval(globalThis.__iv); globalThis.__ticks');
-    expect(ticks, greaterThanOrEqualTo(2));
+    final v = await engine.evaluateAsync('''
+new Promise((resolve) => {
+  let n = 0;
+  const id = setInterval(() => {
+    n++;
+    if (n === 3) { clearInterval(id); resolve(n); }
+  }, 5);
+})
+''');
+    expect(v, 3);
   });
 
   test('import.meta.url 指向模块名', () async {

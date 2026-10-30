@@ -727,6 +727,15 @@ class QuickjsEngine implements JsEngine {
   Future<void> _waitForActivity() =>
       (_activitySignal ??= Completer<void>()).future;
 
+  /// 正在 `_waitForActivity()` 挂起的执行链数量。
+  ///
+  /// 前台链（evaluateAsync/callAsync）等待期间不执行任何 JS，但持有
+  /// [_foregroundGate]；若 timer 回调仍走 callAsync 抢闸门，就会与「等
+  /// timer 回调 settle 的 promise」互相等待 → 死锁。挂起计数 > 0 时，
+  /// timer 回调直接执行（见 [_callTimerFn]），这是安全的：Dart Timer
+  /// 只会在 isolate 空闲（没有同步 JS 在跑）时触发。
+  int _activityWaiters = 0;
+
   void _signalActivity() {
     final c = _activitySignal;
     _activitySignal = null;
@@ -808,7 +817,12 @@ class QuickjsEngine implements JsEngine {
       state = _bridge.getPromiseState(_ctxPointer, slot);
       if (state != 0) break;
       if (_asyncInFlight.isNotEmpty) {
-        await _waitForActivity();
+        _activityWaiters++;
+        try {
+          await _waitForActivity();
+        } finally {
+          _activityWaiters--;
+        }
         state = _bridge.getPromiseState(_ctxPointer, slot);
         continue;
       }
@@ -925,10 +939,21 @@ class QuickjsEngine implements JsEngine {
     );
   }
 
+  /// timer 回调执行通道。
+  ///
+  /// 前台链正在 `_waitForActivity()` 挂起时不持有执行权（没有 JS 在跑），
+  /// 此时若仍走 [callAsync] 抢 `_foregroundGate`，会与「等本回调 settle 的
+  /// promise」互锁（setTimeout/setInterval 回调 resolve 前台 await 链的经典
+  /// 死锁）。挂起期间直接执行；否则保持原有串行语义。
+  Future<Object?> _callTimerFn(JsFunctionRef fn) {
+    if (_activityWaiters == 0) return callAsync(fn, const []);
+    return _runGuardedAsync(() => _callSlotAsync(fn.slot, const []));
+  }
+
   /// setInterval 单次回调：异常进后台错误，不打断后续周期。
   Future<void> _fireInterval(JsFunctionRef fn, int id) async {
     try {
-      await callAsync(fn, const []);
+      await _callTimerFn(fn);
     } catch (e) {
       _backgroundErrors.add('interval: $e');
     }
@@ -936,7 +961,7 @@ class QuickjsEngine implements JsEngine {
 
   Future<void> _fireTimer(JsFunctionRef fn, int key) async {
     try {
-      await callAsync(fn, const []);
+      await _callTimerFn(fn);
     } catch (e) {
       _backgroundErrors.add('timer: $e');
     } finally {
