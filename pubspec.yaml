@@ -1,8 +1,10 @@
 name: qjs_ultra
-description: >-
-  QuickJS 引擎的 Dart/Flutter 绑定：本仓 so（libquickjs_bridge.so）的 FFI
-  声明 + 引擎生命周期封装。纯 Dart + dart:ffi，不依赖 Flutter，可用于
-  Flutter app / 纯 Dart CLI / 服务端。C 源码与本包同仓，so 由本仓 CI 出包。
+# KEEP THIS FILE ASCII-ONLY. pub reads git-sourced pubspecs via `git show`
+# stdout decoded with systemEncoding; on Chinese Windows (CP936) UTF-8
+# non-ASCII gets GBK-misdecoded and byte misalignment eats the `version:`
+# line, so the version always resolves to 0.0.0 (Dart 3.13.2, verified).
+# Explanations in Chinese belong in README, never here.
+description: QuickJS engine Dart/FFI bindings and wrapper (libquickjs_bridge.so). Dart-only, no Flutter deps. C sources in-repo; .so built by CI.
 version: 0.1.0
 publish_to: none
 
